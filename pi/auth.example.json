@@ -1,0 +1,15 @@
+{
+  "_comment": "这是 ~/.pi/agent/auth.json 的结构示例，只说明字段形状，不含真实凭据。真实文件由 pi 自己写，权限 0600，永远不要提交进仓库。类型定义见 @earendil-works/pi-ai/dist/auth/types.d.ts 的 Credential。",
+
+  "anthropic": {
+    "type": "oauth",
+    "refresh": "sk-ant-ort01-REPLACE-ME",
+    "access": "sk-ant-oat01-REPLACE-ME",
+    "expires": 0
+  },
+
+  "deepseek": {
+    "type": "api_key",
+    "key": "REPLACE-ME"
+  }
+}

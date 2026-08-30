@@ -1,0 +1,7 @@
+{
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-opus-5",
+  "theme": "dark",
+  "hideThinkingBlock": true,
+  "defaultThinkingLevel": "high"
+}
