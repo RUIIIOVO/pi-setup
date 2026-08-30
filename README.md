@@ -250,9 +250,11 @@ display:
   hideToolActivity: true
 ```
 
-**在 herdr 这类终端复用器里读图片会看到一大片空白**：pi 看到宿主是 Ghostty / kitty / WezTerm 就按 kitty graphics 协议发图并预留行高（对 tmux 它会主动关掉图片，所以 tmux 没这个问题），而复用器若不转发图形序列，就只剩下空行。两条路：
+**在 herdr 这类终端复用器里读图片会看到一大片空白**：pi 看到宿主是 Ghostty / kitty / WezTerm 就按 kitty graphics 协议发图并预留行高（对 tmux 它会主动关掉图片，所以 tmux 没这个问题），而复用器若不转发图形序列，就只剩下空行。
 
-- 让复用器自己画图（herdr：`~/.config/herdr/config.toml` 里 `[experimental] kitty_graphics = true`；**实测 `herdr server reload-config` 不足以生效，要重启 server**）
+这是复用器的事，**pi 侧不用改**：同一台机器上直接在 Ghostty 里跑 pi，图片正常显示；套进 herdr 就只剩空行。两条路：
+
+- 让复用器自己画图（herdr：`~/.config/herdr/config.toml` 里 `[experimental] kitty_graphics = true`）。**这个开关只在 server 启动时读一次，`herdr server reload-config` 不算数，必须 `herdr server stop` 后重起**（pane 里的进程会被杀，回头用 `pi --continue` 接）
 - 或者关掉 pi 的图片渲染：`~/.pi/agent/settings.json` 加 `"terminal": { "showImages": false }`，图片退化成 `[image/png 3024x1746]` 一行文本，**模型照样收得到图**，只是 TUI 不画
 
 ## 致谢
