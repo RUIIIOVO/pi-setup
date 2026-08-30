@@ -1,0 +1,11 @@
+# 凭据一律不入库
+auth.json
+*.token
+*.key
+.env
+
+# 本地产物
+*.bak-*
+*.orig
+__pycache__/
+.DS_Store
