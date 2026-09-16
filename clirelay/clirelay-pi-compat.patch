@@ -1,0 +1,467 @@
+diff --git a/internal/api/routes_public.go b/internal/api/routes_public.go
+index ab3cdd43..5d07a8ec 100644
+--- a/internal/api/routes_public.go
++++ b/internal/api/routes_public.go
+@@ -81,6 +81,28 @@ func (s *Server) setupRoutes() {
+ 	groupedV1.Use(SystemPromptMiddleware())
+ 	registerV1Routes(groupedV1)
+ 
++	// Codex CLI direct route aliases (chatgpt_base_url compatible). Upstream
++	// CLIProxyAPI exposes these; clients such as the Codex CLI and the pi
++	// CLIProxyAPI provider address inference as {root}/backend-api/codex/...
++	codexDirect := s.engine.Group("/backend-api/codex")
++	codexDirect.Use(AuthMiddleware(s.accessManager))
++	codexDirect.Use(rewrittenGroupRoutingMiddleware(resolveRoute))
++	codexDirect.Use(channelGroupAuthorizationMiddleware())
++	codexDirect.Use(middleware.QuotaMiddleware())
++	codexDirect.Use(s.modelRestrictionMiddleware())
++	codexDirect.Use(ccSwitchOpenAIModelMappingMiddleware())
++	codexDirect.Use(SystemPromptMiddleware())
++	{
++		codexDirect.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
++		codexDirect.GET("/responses", func(c *gin.Context) {
++			clearServerWriteDeadline(c)
++			openaiResponsesHandlers.ResponsesWebsocket(c)
++		})
++		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
++		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
++		codexDirect.POST("/alpha/search", openaiResponsesHandlers.AlphaSearch)
++	}
++
+ 	v1beta := s.engine.Group("/v1beta")
+ 	v1beta.Use(AuthMiddleware(s.accessManager))
+ 	v1beta.Use(rewrittenGroupRoutingMiddleware(resolveRoute))
+diff --git a/internal/api/server_models_endpoint.go b/internal/api/server_models_endpoint.go
+index 63a18884..c5ef11ab 100644
+--- a/internal/api/server_models_endpoint.go
++++ b/internal/api/server_models_endpoint.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/identity"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/management/modelcatalog"
+ 	modelconfigsettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/modelconfig"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+ 	internalrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/routing"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
+@@ -146,6 +147,7 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
+ 		// Attach tenant catalog metadata so public clients (apikey-lookup plaza)
+ 		// can show description + pricing without management credentials.
+ 		enrichOpenAIModelsWithCatalog(tenantID, resp.Data)
++		enrichOpenAIModelsWithStaticCapabilities(resp.Data)
+ 
+ 		filteredJSON, err := json.Marshal(resp)
+ 		if err != nil {
+@@ -228,6 +230,125 @@ func enrichOpenAIModelsWithCatalog(tenantID string, models []map[string]interfac
+ 	}
+ }
+ 
++// enrichOpenAIModelsWithStaticCapabilities publishes the capability metadata the
++// static registry already knows about (context window, completion cap, reasoning
++// efforts, modalities) on the OpenAI-compatible /v1/models payload.
++//
++// Clients that build their model catalog from this endpoint (Codex CLI, the pi
++// CLIProxyAPI provider, ...) otherwise have to fall back to conservative
++// defaults such as a 128k context window and no reasoning support.
++// Existing keys are never overwritten.
++func enrichOpenAIModelsWithStaticCapabilities(models []map[string]interface{}) {
++	for _, model := range models {
++		if model == nil {
++			continue
++		}
++		id, _ := model["id"].(string)
++		id = strings.TrimSpace(id)
++		if id == "" {
++			continue
++		}
++		info := registry.LookupStaticModelInfo(id)
++		if info == nil {
++			if resolved := registry.LookupModelInfo(id); resolved != nil {
++				info = resolved
++			}
++		}
++		if info == nil {
++			continue
++		}
++
++		contextWindow := info.ContextLength
++		if contextWindow <= 0 {
++			contextWindow = info.InputTokenLimit
++		}
++		if contextWindow > 0 {
++			if _, exists := model["context_window"]; !exists {
++				model["context_window"] = contextWindow
++			}
++			if _, exists := model["max_context_window"]; !exists {
++				model["max_context_window"] = contextWindow
++			}
++		}
++
++		maxCompletion := info.MaxCompletionTokens
++		if maxCompletion <= 0 {
++			maxCompletion = info.OutputTokenLimit
++		}
++		if maxCompletion > 0 {
++			if _, exists := model["max_completion_tokens"]; !exists {
++				model["max_completion_tokens"] = maxCompletion
++			}
++			if _, exists := model["max_output_tokens"]; !exists {
++				model["max_output_tokens"] = maxCompletion
++			}
++		}
++
++		if displayName := strings.TrimSpace(info.DisplayName); displayName != "" {
++			if existing, _ := model["display_name"].(string); strings.TrimSpace(existing) == "" {
++				model["display_name"] = displayName
++			}
++		}
++
++		if levels := staticReasoningLevels(info); len(levels) > 0 {
++			if _, exists := model["supported_reasoning_levels"]; !exists {
++				model["supported_reasoning_levels"] = levels
++			}
++		}
++
++		if _, exists := model["input_modalities"]; !exists {
++			modalities := []string{"text"}
++			if supportsVision, ok := model["supports_vision"].(bool); ok && supportsVision {
++				modalities = append(modalities, "image")
++			} else if staticSupportsVision(info) {
++				modalities = append(modalities, "image")
++				model["supports_vision"] = true
++			}
++			model["input_modalities"] = modalities
++		}
++	}
++}
++
++// staticReasoningLevels maps the registry thinking capability onto the discrete
++// effort vocabulary that OpenAI-responses style clients expect.
++func staticReasoningLevels(info *registry.ModelInfo) []string {
++	if info == nil || info.Thinking == nil {
++		return nil
++	}
++	thinking := info.Thinking
++	levels := make([]string, 0, 6)
++	if thinking.ZeroAllowed {
++		levels = append(levels, "none")
++	}
++	if len(thinking.Levels) > 0 {
++		for _, level := range thinking.Levels {
++			level = strings.ToLower(strings.TrimSpace(level))
++			if level == "" || level == "none" {
++				continue
++			}
++			levels = append(levels, level)
++		}
++		return levels
++	}
++	if thinking.Max <= 0 && !thinking.DynamicAllowed {
++		return nil
++	}
++	return append(levels, "low", "medium", "high")
++}
++
++// staticSupportsVision reports whether a statically known model accepts images.
++func staticSupportsVision(info *registry.ModelInfo) bool {
++	if info == nil {
++		return false
++	}
++	switch strings.ToLower(strings.TrimSpace(info.Type)) {
++	case "claude", "bedrock", "gemini", "openai":
++		return true
++	default:
++		return false
++	}
++}
++
+ func ccSwitchRequestModelAllowedForTarget(id string, route *internalrouting.PathRouteContext, allowedModels map[string]struct{}) bool {
+ 	id = strings.TrimSpace(id)
+ 	if id == "" || route == nil || route.CcSwitch == nil || len(allowedModels) == 0 {
+diff --git a/internal/config/identity_fingerprint.go b/internal/config/identity_fingerprint.go
+index dcd9f61b..0d3d8638 100644
+--- a/internal/config/identity_fingerprint.go
++++ b/internal/config/identity_fingerprint.go
+@@ -45,7 +45,7 @@ const (
+ 	// is a combination no official client emits.
+ 	DefaultCodexFingerprintConvergenceMode = CodexFingerprintConvergenceDevice
+ 
+-	DefaultClaudeFingerprintCLIVersion              = "2.1.161"
++	DefaultClaudeFingerprintCLIVersion              = "2.1.252"
+ 	DefaultClaudeFingerprintEntrypoint              = "cli"
+ 	DefaultClaudeFingerprintAnthropicBeta           = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11"
+ 	DefaultClaudeFingerprintStainlessPackageVersion = "0.94.0"
+diff --git a/internal/config/identity_fingerprint_test.go b/internal/config/identity_fingerprint_test.go
+index 3aa3ddd9..08cc3da5 100644
+--- a/internal/config/identity_fingerprint_test.go
++++ b/internal/config/identity_fingerprint_test.go
+@@ -94,13 +94,13 @@ func TestDefaultClaudeIdentityFingerprintMirrorsClaudeCode(t *testing.T) {
+ 	if !got.Enabled {
+ 		t.Fatalf("Enabled = false, want true by default")
+ 	}
+-	if got.CLIVersion != "2.1.161" {
+-		t.Fatalf("CLIVersion = %q, want 2.1.161", got.CLIVersion)
++	if got.CLIVersion != "2.1.252" {
++		t.Fatalf("CLIVersion = %q, want 2.1.252", got.CLIVersion)
+ 	}
+ 	if got.Entrypoint != "cli" {
+ 		t.Fatalf("Entrypoint = %q, want cli", got.Entrypoint)
+ 	}
+-	if got.UserAgent != "claude-cli/2.1.161 (external, cli)" {
++	if got.UserAgent != "claude-cli/2.1.252 (external, cli)" {
+ 		t.Fatalf("UserAgent = %q, want Claude Code user agent", got.UserAgent)
+ 	}
+ 	if got.StainlessPackageVersion != "0.94.0" {
+diff --git a/internal/registry/model_definitions.go b/internal/registry/model_definitions.go
+index aac63621..1ff0e09e 100644
+--- a/internal/registry/model_definitions.go
++++ b/internal/registry/model_definitions.go
+@@ -32,7 +32,7 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
+ 	key := strings.ToLower(strings.TrimSpace(channel))
+ 	switch key {
+ 	case "claude":
+-		return GetClaudeModels()
++		return ClaudeModelsWithLatest()
+ 	case "bedrock":
+ 		return GetBedrockModels()
+ 	case "gemini":
+@@ -99,7 +99,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
+ 	}
+ 
+ 	allModels := [][]*ModelInfo{
+-		GetClaudeModels(),
++		ClaudeModelsWithLatest(),
+ 		GetBedrockModels(),
+ 		GetGeminiModels(),
+ 		GetGeminiVertexModels(),
+diff --git a/internal/registry/model_definitions_claude_latest.go b/internal/registry/model_definitions_claude_latest.go
+new file mode 100644
+index 00000000..e1cbb995
+--- /dev/null
++++ b/internal/registry/model_definitions_claude_latest.go
+@@ -0,0 +1,89 @@
++package registry
++
++// Latest-generation Claude model definitions.
++//
++// Kept out of model_definitions_static_data.go because that file is frozen at
++// its current size by the structure ratchet in
++// scripts/check-backend-structure.py and may only shrink. Follows the same
++// convention as model_definitions_commandcode.go.
++//
++// These ids are served by Anthropic's Claude Code OAuth surface but are absent
++// from the upstream static snapshot, so they are declared here to carry the
++// context window, completion cap and reasoning levels the pi client needs.
++
++// GetLatestClaudeModels returns Claude models newer than the upstream static
++// snapshot in model_definitions_static_data.go.
++func GetLatestClaudeModels() []*ModelInfo {
++	thinking := func() *ThinkingSupport {
++		return &ThinkingSupport{
++			Min:            1024,
++			Max:            128000,
++			ZeroAllowed:    true,
++			DynamicAllowed: false,
++			Levels:         []string{"low", "medium", "high", "xhigh", "max"},
++		}
++	}
++
++	return []*ModelInfo{
++		{
++			ID:                  "claude-opus-5",
++			Object:              "model",
++			Created:             1783641600, // 2026-07-13
++			OwnedBy:             "anthropic",
++			Type:                "claude",
++			DisplayName:         "Claude Opus 5",
++			Description:         "Latest generation Claude Opus frontier model",
++			ContextLength:       1000000,
++			MaxCompletionTokens: 128000,
++			Thinking:            thinking(),
++		},
++		{
++			ID:                  "claude-sonnet-5",
++			Object:              "model",
++			Created:             1783641600, // 2026-07-13
++			OwnedBy:             "anthropic",
++			Type:                "claude",
++			DisplayName:         "Claude Sonnet 5",
++			Description:         "Latest generation Claude Sonnet balanced model",
++			ContextLength:       1000000,
++			MaxCompletionTokens: 128000,
++			Thinking:            thinking(),
++		},
++		{
++			ID:                  "claude-fable-5-1",
++			Object:              "model",
++			Created:             1789521272, // 2026-09-15
++			OwnedBy:             "anthropic",
++			Type:                "claude",
++			DisplayName:         "Claude Fable 5.1",
++			Description:         "Claude Fable long-horizon agentic model",
++			ContextLength:       1000000,
++			MaxCompletionTokens: 128000,
++			Thinking:            thinking(),
++		},
++		{
++			ID:                  "claude-fable-5",
++			Object:              "model",
++			Created:             1781740800, // 2026-06-21
++			OwnedBy:             "anthropic",
++			Type:                "claude",
++			DisplayName:         "Claude Fable 5",
++			Description:         "Claude Fable long-horizon agentic model",
++			ContextLength:       1000000,
++			MaxCompletionTokens: 128000,
++			Thinking:            thinking(),
++		},
++	}
++}
++
++// ClaudeModelsWithLatest returns the latest-generation Claude definitions
++// followed by the upstream static snapshot. Callers use this instead of
++// GetClaudeModels so newer ids win on de-duplication.
++func ClaudeModelsWithLatest() []*ModelInfo {
++	latest := GetLatestClaudeModels()
++	base := GetClaudeModels()
++	out := make([]*ModelInfo, 0, len(latest)+len(base))
++	out = append(out, latest...)
++	out = append(out, base...)
++	return out
++}
+diff --git a/internal/runtime/executor/claude_transport.go b/internal/runtime/executor/claude_transport.go
+index 9c7b165c..8cfec76c 100644
+--- a/internal/runtime/executor/claude_transport.go
++++ b/internal/runtime/executor/claude_transport.go
+@@ -6,7 +6,9 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"regexp"
+ 	"runtime"
++	"strconv"
+ 	"strings"
+ 
+ 	"github.com/andybalholm/brotli"
+@@ -237,7 +239,18 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
+ 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Arch", mapStainlessArch())
+ 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Os", mapStainlessOS())
+ 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
+-	misc.EnsureHeader(r.Header, ginHeaders, "User-Agent", hdrDefault(hd.UserAgent, config.BuildClaudeFingerprintUserAgent(config.DefaultClaudeFingerprintCLIVersion, config.DefaultClaudeFingerprintEntrypoint)))
++	// Anthropic gates newer models (e.g. claude-fable-5-1) on the reported
++	// Claude Code version and on the canonical
++	// "claude-cli/<version> (external, <entrypoint>)" User-Agent shape. A
++	// client that sends its own agent (curl, a bare "claude-cli/x.y.z"
++	// without the suffix, or an outdated version) would otherwise be
++	// forwarded verbatim and rejected with claude_code_version_too_old.
++	// Forward a client agent only when it already satisfies the gate.
++	canonicalUA := hdrDefault(hd.UserAgent, config.BuildClaudeFingerprintUserAgent(config.DefaultClaudeFingerprintCLIVersion, config.DefaultClaudeFingerprintEntrypoint))
++	if ua := strings.TrimSpace(ginHeaders.Get("User-Agent")); claudeUserAgentMeetsGate(ua) {
++		canonicalUA = ua
++	}
++	r.Header.Set("User-Agent", canonicalUA)
+ 	r.Header.Set("Connection", "keep-alive")
+ 	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+ 	if stream {
+@@ -263,3 +276,44 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
+ 	}
+ 	return
+ }
++
++// claudeGateUARe matches the canonical Claude Code User-Agent shape that
++// Anthropic parses for its minimum-version model gate.
++var claudeGateUARe = regexp.MustCompile(`(?i)^claude-cli/([0-9]+(?:\.[0-9]+){0,3})\s+\(external,\s*[^)]+\)`)
++
++// claudeUserAgentMeetsGate reports whether a client-supplied User-Agent is a
++// well-formed Claude Code agent at or above the configured minimum version.
++func claudeUserAgentMeetsGate(ua string) bool {
++	m := claudeGateUARe.FindStringSubmatch(strings.TrimSpace(ua))
++	if m == nil {
++		return false
++	}
++	return compareClaudeVersions(m[1], config.DefaultClaudeFingerprintCLIVersion) >= 0
++}
++
++// compareClaudeVersions compares dotted numeric versions, treating missing
++// components as zero. Returns -1, 0 or 1.
++func compareClaudeVersions(a, b string) int {
++	as := strings.Split(a, ".")
++	bs := strings.Split(b, ".")
++	n := len(as)
++	if len(bs) > n {
++		n = len(bs)
++	}
++	for i := 0; i < n; i++ {
++		var av, bv int
++		if i < len(as) {
++			av, _ = strconv.Atoi(strings.TrimSpace(as[i]))
++		}
++		if i < len(bs) {
++			bv, _ = strconv.Atoi(strings.TrimSpace(bs[i]))
++		}
++		if av != bv {
++			if av < bv {
++				return -1
++			}
++			return 1
++		}
++	}
++	return 0
++}
+diff --git a/internal/translator/claude/openai/responses/claude_openai-responses_response.go b/internal/translator/claude/openai/responses/claude_openai-responses_response.go
+index e77b09e1..5bfb8e78 100644
+--- a/internal/translator/claude/openai/responses/claude_openai-responses_response.go
++++ b/internal/translator/claude/openai/responses/claude_openai-responses_response.go
+@@ -26,6 +26,9 @@ type claudeToResponsesState struct {
+ 	FuncCallIDs map[int]string // index -> call id
+ 	// message text aggregation
+ 	TextBuf strings.Builder
++	// offset of the currently open text block inside TextBuf, so the
++	// *.done events can carry the text produced by that block
++	TextBlockStart int
+ 	// reasoning state
+ 	ReasoningActive    bool
+ 	ReasoningItemID    string
+@@ -79,6 +82,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
+ 			st.CreatedAt = time.Now().Unix()
+ 			// Reset per-message aggregation state
+ 			st.TextBuf.Reset()
++			st.TextBlockStart = 0
+ 			st.ReasoningBuf.Reset()
+ 			st.ReasoningActive = false
+ 			st.InTextBlock = false
+@@ -127,6 +131,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
+ 		if typ == "text" {
+ 			// open message item + content part
+ 			st.InTextBlock = true
++			st.TextBlockStart = st.TextBuf.Len()
+ 			st.CurrentMsgID = fmt.Sprintf("msg_%s_0", st.ResponseID)
+ 			item := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`
+ 			item, _ = sjson.Set(item, "sequence_number", nextSeq())
+@@ -219,17 +224,27 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
+ 	case "content_block_stop":
+ 		idx := int(root.Get("index").Int())
+ 		if st.InTextBlock {
++			// Text produced by the block that is closing. Clients (Codex CLI, pi)
++			// treat these *.done payloads as authoritative and overwrite whatever
++			// they accumulated from the deltas, so they must carry the real text.
++			blockText := st.TextBuf.String()
++			if st.TextBlockStart >= 0 && st.TextBlockStart <= len(blockText) {
++				blockText = blockText[st.TextBlockStart:]
++			}
+ 			done := `{"type":"response.output_text.done","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"text":"","logprobs":[]}`
+ 			done, _ = sjson.Set(done, "sequence_number", nextSeq())
+ 			done, _ = sjson.Set(done, "item_id", st.CurrentMsgID)
++			done, _ = sjson.Set(done, "text", blockText)
+ 			out = append(out, emitEvent("response.output_text.done", done))
+ 			partDone := `{"type":"response.content_part.done","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`
+ 			partDone, _ = sjson.Set(partDone, "sequence_number", nextSeq())
+ 			partDone, _ = sjson.Set(partDone, "item_id", st.CurrentMsgID)
++			partDone, _ = sjson.Set(partDone, "part.text", blockText)
+ 			out = append(out, emitEvent("response.content_part.done", partDone))
+ 			final := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"completed","content":[{"type":"output_text","text":""}],"role":"assistant"}}`
+ 			final, _ = sjson.Set(final, "sequence_number", nextSeq())
+ 			final, _ = sjson.Set(final, "item.id", st.CurrentMsgID)
++			final, _ = sjson.Set(final, "item.content.0.text", blockText)
+ 			out = append(out, emitEvent("response.output_item.done", final))
+ 			st.InTextBlock = false
+ 		} else if st.InFuncBlock {
