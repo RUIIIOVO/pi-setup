@@ -170,6 +170,26 @@ install.py 只会打印「有哪些 provider、各是什么类型」，不读取
 python3 install.py --seed-models   # 仅当本地还没有 models-store.json 时才写
 ```
 
+### 6. CLIProxyAPI provider 补丁（手动装，不在 install.py 里）
+
+这条改的是 **npm 包** `@router-for-me/pi-cliproxyapi-provider` 的产物，不是 pi 本体，所以 install.py 不管，升级插件后要手动重跑：
+
+```bash
+python3 ~/.pi/patches/apply-cliproxyapi-maxtokens.py
+rm -f ~/.pi/agent/cliproxyapi-models.json   # 强制下次启动重新拉目录
+```
+
+插件给每个模型写死 `maxTokens: 16384`，128k 输出的模型被砍到 16k；补丁让它读服务器下发的 `max_completion_tokens`。
+
+> 这里**曾经**还有一个 `apply-cliproxyapi-model-allowlist.py`，把插件注册的模型硬编码成 4 个 Claude id。2026-09-17 已删除：它把 Gemini 全挡在外面，而且模型列表本来就该由服务器决定。现在服务端的 `/v1/models?client_version=pi` 返回的目录和管理面板/ccswitch 是同一份（见 `clirelay/README.md` 第 9 条），pi 每次刷新自动跟随 —— 面板里启用一个模型，pi 下次启动就有；禁用就消失；客户端不维护任何 id 列表。
+
+验证（`pi -p` 会顺带触发一次目录刷新）：
+
+```bash
+pi -p --no-session -nt --provider cliproxyapi --model gemini-3.8-flash-low 'reply with the single word: ok'
+python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.pi/agent/cliproxyapi-models.json')));print(len(d['models']))"
+```
+
 ## 验证
 
 ```bash

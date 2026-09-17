@@ -1,3 +1,16 @@
+diff --git a/docs/internal-review/backend-structure-allowlist.json b/docs/internal-review/backend-structure-allowlist.json
+index ad976c51..fe601438 100644
+--- a/docs/internal-review/backend-structure-allowlist.json
++++ b/docs/internal-review/backend-structure-allowlist.json
+@@ -26,7 +26,7 @@
+       },
+       {
+         "path": "internal/management/modelcatalog/availability.go",
+-        "max_lines": 987
++        "max_lines": 977
+       },
+       {
+         "path": "internal/management/settings/providers/provider_keys_extended.go",
 diff --git a/internal/api/routes_public.go b/internal/api/routes_public.go
 index ab3cdd43..5d07a8ec 100644
 --- a/internal/api/routes_public.go
@@ -31,8 +44,274 @@ index ab3cdd43..5d07a8ec 100644
  	v1beta := s.engine.Group("/v1beta")
  	v1beta.Use(AuthMiddleware(s.accessManager))
  	v1beta.Use(rewrittenGroupRoutingMiddleware(resolveRoute))
+diff --git a/internal/api/server_model_disabled_test.go b/internal/api/server_model_disabled_test.go
+new file mode 100644
+index 00000000..ff324de0
+--- /dev/null
++++ b/internal/api/server_model_disabled_test.go
+@@ -0,0 +1,179 @@
++package api
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
++	modelconfigsettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/modelconfig"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
++	"github.com/tidwall/gjson"
++)
++
++// Disabling a model in the catalog only ever stopped a config row from
++// contributing a model of its own. Anything the static registry already served
++// stayed listed and stayed callable, so "disabled" meant nothing for exactly
++// the models an operator is most likely to switch off.
++
++func initDisabledModelTestDB(t *testing.T) {
++	t.Helper()
++	usage.CloseDB()
++	dbPath := filepath.Join(t.TempDir(), "usage.db")
++	if err := usage.InitDB(dbPath, config.RequestLogStorageConfig{}, time.UTC); err != nil {
++		t.Fatalf("InitDB() error = %v", err)
++	}
++	t.Cleanup(usage.CloseDB)
++}
++
++func seedModelConfig(t *testing.T, modelID string, enabled bool) {
++	t.Helper()
++	if _, err := modelconfigsettings.UpsertConfig(modelconfigsettings.UpsertConfigInput{
++		ModelID:     modelID,
++		Scope:       "active",
++		OwnedBy:     "anthropic",
++		Enabled:     enabled,
++		PricingMode: "call",
++	}); err != nil {
++		t.Fatalf("UpsertConfig(%q) error = %v", modelID, err)
++	}
++}
++
++// runRestrictionMiddleware drives just the middleware, so the assertions are
++// about the disabled-model decision and not about routing or upstream calls.
++func runRestrictionMiddleware(t *testing.T, body string) *httptest.ResponseRecorder {
++	t.Helper()
++	gin.SetMode(gin.TestMode)
++
++	server := &Server{cfg: &config.Config{}}
++	engine := gin.New()
++	engine.POST("/v1/chat/completions", server.modelRestrictionMiddleware(), func(c *gin.Context) {
++		c.JSON(http.StatusOK, gin.H{"reached_upstream": true})
++	})
++
++	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
++	req.Header.Set("Content-Type", "application/json")
++	rec := httptest.NewRecorder()
++	engine.ServeHTTP(rec, req)
++	return rec
++}
++
++func TestDisabledModelRequestIsRejected(t *testing.T) {
++	initDisabledModelTestDB(t)
++	seedModelConfig(t, "claude-opus-4-6", false)
++
++	rec := runRestrictionMiddleware(t, `{"model":"claude-opus-4-6"}`)
++
++	if rec.Code != http.StatusNotFound {
++		t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
++	}
++	if code := gjson.Get(rec.Body.String(), "error.code").String(); code != "model_not_found" {
++		t.Errorf("error.code = %q, want model_not_found", code)
++	}
++	if strings.Contains(rec.Body.String(), "reached_upstream") {
++		t.Error("request reached the upstream handler despite the model being disabled")
++	}
++}
++
++func TestEnabledModelRequestPassesThrough(t *testing.T) {
++	initDisabledModelTestDB(t)
++	seedModelConfig(t, "claude-opus-4-6", false)
++	seedModelConfig(t, "claude-opus-5", true)
++
++	rec := runRestrictionMiddleware(t, `{"model":"claude-opus-5"}`)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
++	}
++	if !strings.Contains(rec.Body.String(), "reached_upstream") {
++		t.Error("enabled model did not reach the upstream handler")
++	}
++}
++
++func TestModelWithNoConfigRowPassesThrough(t *testing.T) {
++	initDisabledModelTestDB(t)
++	seedModelConfig(t, "claude-opus-4-6", false)
++
++	// A model the operator never touched has no row at all; it must not be
++	// swept up by the disabled check.
++	rec := runRestrictionMiddleware(t, `{"model":"gpt-5"}`)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
++	}
++}
++
++func TestDisabledModelCheckIsCaseInsensitive(t *testing.T) {
++	initDisabledModelTestDB(t)
++	seedModelConfig(t, "claude-opus-4-6", false)
++
++	rec := runRestrictionMiddleware(t, `{"model":"CLAUDE-Opus-4-6"}`)
++
++	if rec.Code != http.StatusNotFound {
++		t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
++	}
++}
++
++func TestPrefixedAliasOfDisabledModelIsRejected(t *testing.T) {
++	initDisabledModelTestDB(t)
++	seedModelConfig(t, "gpt-oss:20b", false)
++
++	// Provider-prefixed aliases route to the bare ID, so they must not be a way
++	// around the toggle.
++	rec := runRestrictionMiddleware(t, `{"model":"ollama/gpt-oss:20b"}`)
++
++	if rec.Code != http.StatusNotFound {
++		t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
++	}
++}
++
++func TestRequestWithoutModelIsUntouched(t *testing.T) {
++	initDisabledModelTestDB(t)
++	seedModelConfig(t, "claude-opus-4-6", false)
++
++	rec := runRestrictionMiddleware(t, `{}`)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
++	}
++}
++
++func TestDropDisabledCatalogModelsFiltersListing(t *testing.T) {
++	initDisabledModelTestDB(t)
++	seedModelConfig(t, "claude-opus-4-6", false)
++	seedModelConfig(t, "claude-opus-5", true)
++
++	models := []map[string]interface{}{
++		{"id": "claude-opus-4-6"},
++		{"id": "claude-opus-5"},
++		{"id": "gpt-5"},
++	}
++
++	got := dropDisabledCatalogModels("", models)
++
++	var ids []string
++	for _, model := range got {
++		id, _ := model["id"].(string)
++		ids = append(ids, id)
++	}
++	want := []string{"claude-opus-5", "gpt-5"}
++	if strings.Join(ids, ",") != strings.Join(want, ",") {
++		t.Fatalf("ids = %v, want %v", ids, want)
++	}
++}
++
++func TestDropDisabledCatalogModelsKeepsListWhenNothingDisabled(t *testing.T) {
++	initDisabledModelTestDB(t)
++	seedModelConfig(t, "claude-opus-5", true)
++
++	models := []map[string]interface{}{{"id": "claude-opus-5"}, {"id": "gpt-5"}}
++	if got := dropDisabledCatalogModels("", models); len(got) != 2 {
++		encoded, _ := json.Marshal(got)
++		t.Fatalf("dropDisabledCatalogModels() = %s, want both models", encoded)
++	}
++}
+diff --git a/internal/api/server_model_restriction.go b/internal/api/server_model_restriction.go
+index 4e67b87c..13e94b77 100644
+--- a/internal/api/server_model_restriction.go
++++ b/internal/api/server_model_restriction.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/bodyutil"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/identity"
++	modelconfigsettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/modelconfig"
+ 	internalrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/routing"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+ )
+@@ -54,7 +55,11 @@ func (s *Server) modelRestrictionMiddleware() gin.HandlerFunc {
+ 
+ 		tenantID := requestTenantID(c)
+ 		hasScopedRestriction := s.hasScopedRoutingModelRestrictionForTenant(tenantID, routeGroup, allowedGroups)
+-		if allowedStr == "" && !hasScopedRestriction && ccSwitchAllowed == nil {
++		// A model switched off in the catalog is refused for everyone, so this
++		// middleware has to inspect the body even when the key itself carries no
++		// allowed-models restriction.
++		disabledModels := modelconfigsettings.DisabledModelIDsForTenant(tenantID)
++		if allowedStr == "" && !hasScopedRestriction && ccSwitchAllowed == nil && len(disabledModels) == 0 {
+ 			c.Next()
+ 			return
+ 		}
+@@ -104,6 +109,13 @@ func (s *Server) modelRestrictionMiddleware() gin.HandlerFunc {
+ 		requestedModel := strings.TrimSpace(bodyObj.Model)
+ 		routingModel := mapCcSwitchRequestModelForRestriction(requestedModel, route)
+ 
++		// Check the model actually routed to as well, so a CC Switch mapping cannot
++		// reach a disabled target through an enabled request alias.
++		if modelIsDisabled(requestedModel, disabledModels) || modelIsDisabled(routingModel, disabledModels) {
++			abortModelDisabled(c, requestedModel)
++			return
++		}
++
+ 		if len(allowedModels) > 0 && !modelInSet(requestedModel, allowedModels) && !modelInSet(routingModel, allowedModels) {
+ 			abortModelNotAllowed(c, requestedModel)
+ 			return
+@@ -127,6 +139,41 @@ func abortModelNotAllowed(c *gin.Context, model string) {
+ 	})
+ }
+ 
++// abortModelDisabled rejects a model the operator switched off in the catalog.
++//
++// This is not an authorization failure — the key may well be allowed to use it —
++// so it reports the model as absent rather than forbidden, matching what the
++// listing endpoints now say about it.
++func abortModelDisabled(c *gin.Context, model string) {
++	c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
++		"error": map[string]interface{}{
++			"message": fmt.Sprintf("model '%s' is disabled", model),
++			"type":    "not_found",
++			"code":    "model_not_found",
++		},
++	})
++}
++
++func modelIsDisabled(model string, disabled map[string]struct{}) bool {
++	if len(disabled) == 0 {
++		return false
++	}
++	key := modelconfigsettings.NormalizeModelKey(model)
++	if key == "" {
++		return false
++	}
++	if _, off := disabled[key]; off {
++		return true
++	}
++	// Prefixed aliases ("ollama/gpt-oss:20b") route to the bare model ID.
++	if idx := strings.Index(key, "/"); idx >= 0 {
++		if _, off := disabled[strings.TrimSpace(key[idx+1:])]; off {
++			return true
++		}
++	}
++	return false
++}
++
+ func modelInSet(model string, allowed map[string]struct{}) bool {
+ 	model = strings.TrimSpace(model)
+ 	if model == "" || len(allowed) == 0 {
 diff --git a/internal/api/server_models_endpoint.go b/internal/api/server_models_endpoint.go
-index 63a18884..c5ef11ab 100644
+index 63a18884..de843291 100644
 --- a/internal/api/server_models_endpoint.go
 +++ b/internal/api/server_models_endpoint.go
 @@ -11,6 +11,7 @@ import (
@@ -43,7 +322,42 @@ index 63a18884..c5ef11ab 100644
  	internalrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/routing"
  	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
  	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
-@@ -146,6 +147,7 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
+@@ -74,15 +75,24 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
+ 		// very setting being edited. Only the editor sets this flag; plaza and
+ 		// catalog keep enforcement.
+ 		ignoreGroupAllowedModels := queryFlagEnabled(c, "ignore_group_allowed_models", "ignore-group-allowed-models")
++		// The pi CLIProxyAPI provider registers every id this endpoint returns into
++		// pi's /model picker, so pi has to see the operator-curated catalog rather
++		// than the raw static registry — otherwise the stale Claude snapshot ids the
++		// management model plaza (and ccswitch) already hide reappear as usable pi
++		// models. pi asks with client_version=pi, the documented contract for this
++		// endpoint, and the catalog stays live: toggling a model in the panel changes
++		// what the next pi refresh registers, with no rebuild and no id list to
++		// maintain on the client.
++		piCatalogRequested := piCatalogRequest(c)
+ 		var portalVisibleModelIDs map[string]struct{}
+-		if tenantScoped && s.handlers != nil {
++		if (tenantScoped || piCatalogRequested) && s.handlers != nil {
+ 			portalVisibleModelIDs = modelcatalog.NewForTenant(tenantID, s.cfg, s.handlers.AuthManager).
+ 				PortalVisibleModelIDs(allowedChannelsRaw, allowedChannelGroupsRaw,
+ 					modelcatalog.AvailabilityFilterOptions{IgnoreGroupAllowedModels: ignoreGroupAllowedModels})
+ 		}
+ 		scopedRoutingRestricted := !ignoreGroupAllowedModels &&
+ 			s.hasScopedRoutingModelRestrictionForTenant(tenantID, routeGroup, allowedChannelGroups)
+-		needsScopeFilter := tenantScoped || allowedModels != nil || allowedChannels != nil || allowedChannelGroups != nil || routeGroup != "" || scopedRoutingRestricted
++		needsScopeFilter := portalVisibleModelIDs != nil || tenantScoped || allowedModels != nil || allowedChannels != nil || allowedChannelGroups != nil || routeGroup != "" || scopedRoutingRestricted
+ 
+ 		recorder := &responseRecorder{
+ 			ResponseWriter: c.Writer,
+@@ -143,9 +153,15 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
+ 			}
+ 		}
+ 
++		// Models switched off in the catalog leave the listing for every caller,
++		// not just the scoped ones — the scope filter above is conditional, and an
++		// operator disabling a model means it is gone regardless of who asks.
++		resp.Data = dropDisabledCatalogModels(tenantID, resp.Data)
++
  		// Attach tenant catalog metadata so public clients (apikey-lookup plaza)
  		// can show description + pricing without management credentials.
  		enrichOpenAIModelsWithCatalog(tenantID, resp.Data)
@@ -51,7 +365,44 @@ index 63a18884..c5ef11ab 100644
  
  		filteredJSON, err := json.Marshal(resp)
  		if err != nil {
-@@ -228,6 +230,125 @@ func enrichOpenAIModelsWithCatalog(tenantID string, models []map[string]interfac
+@@ -160,6 +176,36 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
+ 	}
+ }
+ 
++// dropDisabledCatalogModels removes models the operator switched off in the
++// model catalog from a client-facing listing.
++func dropDisabledCatalogModels(tenantID string, models []map[string]interface{}) []map[string]interface{} {
++	if len(models) == 0 {
++		return models
++	}
++	disabled := modelconfigsettings.DisabledModelIDsForTenant(tenantID)
++	if len(disabled) == 0 {
++		return models
++	}
++	out := make([]map[string]interface{}, 0, len(models))
++	for _, model := range models {
++		id, _ := model["id"].(string)
++		if _, off := disabled[modelconfigsettings.NormalizeModelKey(id)]; off {
++			continue
++		}
++		out = append(out, model)
++	}
++	return out
++}
++
++// piCatalogRequest reports whether the caller is the pi CLIProxyAPI provider, which
++// builds its model picker from GET {root}/v1/models?client_version=pi.
++func piCatalogRequest(c *gin.Context) bool {
++	if c == nil {
++		return false
++	}
++	return strings.EqualFold(strings.TrimSpace(c.Query("client_version")), "pi")
++}
++
+ // enrichOpenAIModelsWithCatalog fills description/pricing/modalities from the
+ // tenant model catalog. Safe for missing rows — leaves the base model map alone.
+ func enrichOpenAIModelsWithCatalog(tenantID string, models []map[string]interface{}) {
+@@ -228,6 +274,125 @@ func enrichOpenAIModelsWithCatalog(tenantID string, models []map[string]interfac
  	}
  }
  
@@ -177,6 +528,115 @@ index 63a18884..c5ef11ab 100644
  func ccSwitchRequestModelAllowedForTarget(id string, route *internalrouting.PathRouteContext, allowedModels map[string]struct{}) bool {
  	id = strings.TrimSpace(id)
  	if id == "" || route == nil || route.CcSwitch == nil || len(allowedModels) == 0 {
+diff --git a/internal/api/server_models_endpoint_test.go b/internal/api/server_models_endpoint_test.go
+index c9a9c88e..570b76e1 100644
+--- a/internal/api/server_models_endpoint_test.go
++++ b/internal/api/server_models_endpoint_test.go
+@@ -172,6 +172,104 @@ func TestUnifiedModelsHandlerKeepsSystemTenantRegistryBehavior(t *testing.T) {
+ 	}
+ }
+ 
++func TestUnifiedModelsHandlerPiCatalogHidesStaticOnlyModels(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	const (
++		systemAuthID = "models-pi-catalog-codex-auth"
++		liveModel    = "claude-live-discovery"
++		staticOnly   = "claude-4-legacy-static"
++	)
++
++	managementauthfiles.ResetDiscoveryCacheForTest()
++	t.Cleanup(managementauthfiles.ResetDiscoveryCacheForTest)
++
++	modelRegistry := registry.GetGlobalRegistry()
++	modelRegistry.UnregisterClient(systemAuthID)
++	t.Cleanup(func() { modelRegistry.UnregisterClient(systemAuthID) })
++	modelRegistry.RegisterClient(systemAuthID, "codex", []*registry.ModelInfo{
++		{ID: liveModel, Object: "model", OwnedBy: "anthropic"},
++		{ID: staticOnly, Object: "model", OwnedBy: "anthropic"},
++	})
++	// Live discovery only knows the current model; staticOnly is the stale
++	// registry row the management plaza already hides.
++	managementauthfiles.StoreDiscoveryCacheForTest(identity.SystemTenantID, "codex", []*registry.ModelInfo{
++		{ID: liveModel, Object: "model", OwnedBy: "anthropic"},
++	})
++
++	authManager := coreauth.NewManager(nil, nil, nil)
++	authManager.SetConfigForTenant(identity.SystemTenantID, &config.Config{})
++	if _, err := authManager.Register(context.Background(), &coreauth.Auth{
++		ID: systemAuthID, TenantID: identity.SystemTenantID, Provider: "codex", Status: coreauth.StatusActive,
++	}); err != nil {
++		t.Fatalf("register system auth: %v", err)
++	}
++
++	cfg := &config.Config{}
++	base := handlers.NewBaseAPIHandlers(&cfg.SDKConfig, authManager)
++	server := &Server{handlers: base, cfg: cfg}
++	router := gin.New()
++	router.GET("/v1/models", func(c *gin.Context) {
++		c.Set("tenantID", identity.SystemTenantID)
++		server.unifiedModelsHandler(
++			openai.NewOpenAIAPIHandler(base),
++			claude.NewClaudeCodeAPIHandler(base),
++		)(c)
++	})
++
++	requestIDs := func(target string) []string {
++		t.Helper()
++		rec := httptest.NewRecorder()
++		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
++		if rec.Code != http.StatusOK {
++			t.Fatalf("GET %s status = %d, body=%s", target, rec.Code, rec.Body.String())
++		}
++		var response struct {
++			Data []map[string]interface{} `json:"data"`
++		}
++		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
++			t.Fatalf("unmarshal GET %s response: %v", target, err)
++		}
++		return modelIDs(response.Data)
++	}
++
++	// The pi provider builds its /model picker from this endpoint, so it must see
++	// the curated catalog rather than the raw static registry.
++	if ids := requestIDs("/v1/models?client_version=pi"); !sameStringSet(ids, []string{liveModel}) {
++		t.Fatalf("pi catalog = %#v, want only %q", ids, liveModel)
++	}
++
++	// Every other caller keeps the previous system-tenant behaviour.
++	if ids := requestIDs("/v1/models"); !containsString(ids, liveModel) || !containsString(ids, staticOnly) {
++		t.Fatalf("system tenant models = %#v, want both registry models", ids)
++	}
++}
++
++func TestPiCatalogRequest(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	cases := []struct {
++		target string
++		want   bool
++	}{
++		{"/v1/models?client_version=pi", true},
++		{"/v1/models?client_version=PI", true},
++		{"/v1/models?client_version=%20pi%20", true},
++		{"/v1/models", false},
++		{"/v1/models?client_version=0.180.0", false},
++		{"/v1/models?client_version=pid", false},
++	}
++	for _, testCase := range cases {
++		rec := httptest.NewRecorder()
++		ctx, _ := gin.CreateTestContext(rec)
++		ctx.Request = httptest.NewRequest(http.MethodGet, testCase.target, nil)
++		if got := piCatalogRequest(ctx); got != testCase.want {
++			t.Errorf("piCatalogRequest(%q) = %v, want %v", testCase.target, got, testCase.want)
++		}
++	}
++	if piCatalogRequest(nil) {
++		t.Error("piCatalogRequest(nil) = true, want false")
++	}
++}
++
+ func TestFilterCodexModelsForCcSwitchRouteReturnsRequestModels(t *testing.T) {
+ 	models := []map[string]interface{}{
+ 		{"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
 diff --git a/internal/config/identity_fingerprint.go b/internal/config/identity_fingerprint.go
 index dcd9f61b..0d3d8638 100644
 --- a/internal/config/identity_fingerprint.go
@@ -211,6 +671,373 @@ index 3aa3ddd9..08cc3da5 100644
  		t.Fatalf("UserAgent = %q, want Claude Code user agent", got.UserAgent)
  	}
  	if got.StainlessPackageVersion != "0.94.0" {
+diff --git a/internal/management/modelcatalog/availability.go b/internal/management/modelcatalog/availability.go
+index 7fe922f5..a666383d 100644
+--- a/internal/management/modelcatalog/availability.go
++++ b/internal/management/modelcatalog/availability.go
+@@ -80,6 +80,7 @@ func (s *Service) ConfiguredAvailability(allowedChannelsRaw, allowedGroupsRaw st
+ 	if !filterOpts.IgnoreGroupAllowedModels {
+ 		allModels = s.filterModelsByRoutingAllowedModels(allModels, allowedGroupsRaw)
+ 	}
++	allModels = dropDisabledModels(allModels, s.tenantID)
+ 
+ 	configByID, pricingByID := pricingLookupMapsForTenant(s.tenantID)
+ 	data := make([]map[string]any, 0, len(allModels))
+@@ -162,6 +163,7 @@ func (s *Service) Models(allowedChannelsRaw, allowedGroupsRaw string, opts ...Av
+ 	if !filterOpts.IgnoreGroupAllowedModels {
+ 		allModels = s.filterModelsByRoutingAllowedModels(allModels, allowedGroupsRaw)
+ 	}
++	allModels = dropDisabledModels(allModels, s.tenantID)
+ 
+ 	configByID, pricingByID := pricingLookupMapsForTenant(s.tenantID)
+ 	filteredModels := make([]map[string]any, len(allModels))
+@@ -728,18 +730,6 @@ func withDefaultMappedOwnerRows(
+ 	return out
+ }
+ 
+-func mappedOwnerRowModelKeys(rows []usage.ModelConfigRow, ownerKeys map[string]bool) map[string]bool {
+-	out := make(map[string]bool, len(rows))
+-	for _, row := range rows {
+-		key := strings.ToLower(strings.TrimSpace(row.ModelID))
+-		if key == "" || !row.Enabled || !ownerKeys[normalizeModelOwnerKey(row.OwnedBy)] {
+-			continue
+-		}
+-		out[key] = true
+-	}
+-	return out
+-}
+-
+ func registryModelCoveredByMappedOwners(
+ 	modelRegistry *registry.ModelRegistry,
+ 	modelID string,
+diff --git a/internal/management/modelcatalog/availability_model_enablement.go b/internal/management/modelcatalog/availability_model_enablement.go
+new file mode 100644
+index 00000000..66cb7780
+--- /dev/null
++++ b/internal/management/modelcatalog/availability_model_enablement.go
+@@ -0,0 +1,50 @@
++package modelcatalog
++
++// Model enablement scoping: which catalog models an operator's enable/disable
++// toggles keep in play, both additively (config rows that contribute a model)
++// and subtractively (models removed from whatever is about to be served).
++
++import (
++	"strings"
++
++	modelconfigsettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/modelconfig"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
++)
++
++// dropDisabledModels removes every model the operator switched off in the model
++// catalog.
++//
++// The additive Enabled checks elsewhere in this file only decide whether a
++// model_configs row contributes a model of its own. Models the static registry
++// already provides never pass through those checks, so without this step
++// disabling one of them changed nothing at all.
++func dropDisabledModels(models []map[string]any, tenantID string) []map[string]any {
++	if len(models) == 0 {
++		return models
++	}
++	disabled := modelconfigsettings.DisabledModelIDsForTenant(tenantID)
++	if len(disabled) == 0 {
++		return models
++	}
++	out := make([]map[string]any, 0, len(models))
++	for _, model := range models {
++		id, _ := model["id"].(string)
++		if _, off := disabled[modelconfigsettings.NormalizeModelKey(id)]; off {
++			continue
++		}
++		out = append(out, model)
++	}
++	return out
++}
++
++func mappedOwnerRowModelKeys(rows []usage.ModelConfigRow, ownerKeys map[string]bool) map[string]bool {
++	out := make(map[string]bool, len(rows))
++	for _, row := range rows {
++		key := strings.ToLower(strings.TrimSpace(row.ModelID))
++		if key == "" || !row.Enabled || !ownerKeys[normalizeModelOwnerKey(row.OwnedBy)] {
++			continue
++		}
++		out[key] = true
++	}
++	return out
++}
+diff --git a/internal/management/modelcatalog/availability_model_enablement_test.go b/internal/management/modelcatalog/availability_model_enablement_test.go
+new file mode 100644
+index 00000000..c564694d
+--- /dev/null
++++ b/internal/management/modelcatalog/availability_model_enablement_test.go
+@@ -0,0 +1,94 @@
++package modelcatalog
++
++import (
++	"testing"
++
++	modelconfigsettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/modelconfig"
++)
++
++// The management catalog is built from the static registry, which never looked
++// at model_configs.Enabled. Disabling a registry-backed model therefore left it
++// listed in the management model picker; dropDisabledModels is the step that
++// makes the toggle mean something there.
++
++func seedEnablement(t *testing.T, modelID string, enabled bool) {
++	t.Helper()
++	if _, err := modelconfigsettings.UpsertConfig(modelconfigsettings.UpsertConfigInput{
++		ModelID:     modelID,
++		Scope:       "active",
++		OwnedBy:     "anthropic",
++		Enabled:     enabled,
++		PricingMode: "call",
++	}); err != nil {
++		t.Fatalf("UpsertConfig(%q) error = %v", modelID, err)
++	}
++}
++
++func modelIDsOf(models []map[string]any) []string {
++	out := make([]string, 0, len(models))
++	for _, model := range models {
++		id, _ := model["id"].(string)
++		out = append(out, id)
++	}
++	return out
++}
++
++func TestDropDisabledModelsRemovesDisabledEntries(t *testing.T) {
++	initModelCatalogTestDB(t)
++
++	seedEnablement(t, "claude-opus-4-6", false)
++	seedEnablement(t, "claude-sonnet-4-6", false)
++	seedEnablement(t, "claude-opus-5", true)
++
++	models := []map[string]any{
++		{"id": "claude-opus-4-6"},
++		{"id": "claude-opus-5"},
++		{"id": "claude-sonnet-4-6"},
++		{"id": "claude-fable-5-1"},
++	}
++
++	got := modelIDsOf(dropDisabledModels(models, ""))
++
++	want := []string{"claude-opus-5", "claude-fable-5-1"}
++	if len(got) != len(want) {
++		t.Fatalf("ids = %v, want %v", got, want)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("ids = %v, want %v", got, want)
++		}
++	}
++}
++
++func TestDropDisabledModelsKeepsEverythingWhenNothingDisabled(t *testing.T) {
++	initModelCatalogTestDB(t)
++
++	seedEnablement(t, "claude-opus-5", true)
++
++	models := []map[string]any{{"id": "claude-opus-5"}, {"id": "claude-fable-5-1"}}
++	if got := dropDisabledModels(models, ""); len(got) != 2 {
++		t.Fatalf("dropDisabledModels() = %v, want both models", modelIDsOf(got))
++	}
++}
++
++func TestDropDisabledModelsMatchesCaseInsensitively(t *testing.T) {
++	initModelCatalogTestDB(t)
++
++	seedEnablement(t, "claude-opus-4-6", false)
++
++	models := []map[string]any{{"id": "Claude-Opus-4-6"}, {"id": "claude-opus-5"}}
++	got := modelIDsOf(dropDisabledModels(models, ""))
++	if len(got) != 1 || got[0] != "claude-opus-5" {
++		t.Fatalf("ids = %v, want [claude-opus-5]", got)
++	}
++}
++
++func TestDropDisabledModelsHandlesEmptyInput(t *testing.T) {
++	initModelCatalogTestDB(t)
++
++	seedEnablement(t, "claude-opus-4-6", false)
++
++	if got := dropDisabledModels(nil, ""); len(got) != 0 {
++		t.Fatalf("dropDisabledModels(nil) = %v, want empty", modelIDsOf(got))
++	}
++}
+diff --git a/internal/management/settings/modelconfig/disabled_models_test.go b/internal/management/settings/modelconfig/disabled_models_test.go
+new file mode 100644
+index 00000000..b6d067c3
+--- /dev/null
++++ b/internal/management/settings/modelconfig/disabled_models_test.go
+@@ -0,0 +1,107 @@
++package modelconfig
++
++import (
++	"testing"
++)
++
++// Disabling a model in the catalog used to be a no-op for anything the static
++// registry already served: every Enabled check in the codebase was additive
++// ("should this row contribute a model?"), so a disabled row simply stopped
++// contributing a model that was being supplied from elsewhere anyway. These
++// cover the subtractive lookup the listing and request paths now rely on.
++
++func seedConfig(t *testing.T, modelID string, enabled bool) {
++	t.Helper()
++	if _, err := UpsertConfig(UpsertConfigInput{
++		ModelID:     modelID,
++		Scope:       "active",
++		OwnedBy:     "anthropic",
++		Enabled:     enabled,
++		PricingMode: "call",
++	}); err != nil {
++		t.Fatalf("UpsertConfig(%q, enabled=%v) error = %v", modelID, enabled, err)
++	}
++}
++
++func TestDisabledModelIDsCollectsOnlyDisabledRows(t *testing.T) {
++	initModelConfigServiceTestDB(t)
++
++	seedConfig(t, "claude-opus-4-6", false)
++	seedConfig(t, "claude-opus-5", true)
++	seedConfig(t, "claude-sonnet-4-6", false)
++
++	disabled := DisabledModelIDs()
++
++	if len(disabled) != 2 {
++		t.Fatalf("DisabledModelIDs() size = %d, want 2 (got %v)", len(disabled), disabled)
++	}
++	for _, want := range []string{"claude-opus-4-6", "claude-sonnet-4-6"} {
++		if _, ok := disabled[want]; !ok {
++			t.Errorf("DisabledModelIDs() missing %q", want)
++		}
++	}
++	if _, ok := disabled["claude-opus-5"]; ok {
++		t.Error("DisabledModelIDs() contains an enabled model")
++	}
++}
++
++func TestDisabledModelIDsIsEmptyWhenNothingDisabled(t *testing.T) {
++	initModelConfigServiceTestDB(t)
++
++	seedConfig(t, "claude-opus-5", true)
++
++	if disabled := DisabledModelIDs(); len(disabled) != 0 {
++		t.Fatalf("DisabledModelIDs() = %v, want empty", disabled)
++	}
++}
++
++func TestDisabledModelIDsKeysAreCaseFolded(t *testing.T) {
++	initModelConfigServiceTestDB(t)
++
++	seedConfig(t, "Claude-Opus-4-6", false)
++
++	disabled := DisabledModelIDs()
++	if _, ok := disabled[NormalizeModelKey("claude-OPUS-4-6")]; !ok {
++		t.Fatalf("DisabledModelIDs() = %v, want a case-folded key", disabled)
++	}
++}
++
++func TestIsModelDisabledForTenant(t *testing.T) {
++	initModelConfigServiceTestDB(t)
++
++	seedConfig(t, "claude-opus-4-6", false)
++	seedConfig(t, "claude-opus-5", true)
++
++	cases := []struct {
++		name  string
++		model string
++		want  bool
++	}{
++		{"disabled row", "claude-opus-4-6", true},
++		{"enabled row", "claude-opus-5", false},
++		{"unknown model is not disabled", "gpt-5", false},
++		{"blank model is not disabled", "   ", false},
++		{"lookup tolerates surrounding space", "  claude-opus-4-6  ", true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := IsModelDisabledForTenant("", tc.model); got != tc.want {
++				t.Errorf("IsModelDisabledForTenant(%q) = %v, want %v", tc.model, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestNormalizeModelKey(t *testing.T) {
++	cases := map[string]string{
++		"  Claude-Opus-4-6 ": "claude-opus-4-6",
++		"CLAUDE-OPUS-5":      "claude-opus-5",
++		"":                   "",
++		"   ":                "",
++	}
++	for input, want := range cases {
++		if got := NormalizeModelKey(input); got != want {
++			t.Errorf("NormalizeModelKey(%q) = %q, want %q", input, got, want)
++		}
++	}
++}
+diff --git a/internal/management/settings/modelconfig/service.go b/internal/management/settings/modelconfig/service.go
+index 9e55d779..52aa9eec 100644
+--- a/internal/management/settings/modelconfig/service.go
++++ b/internal/management/settings/modelconfig/service.go
+@@ -76,6 +76,54 @@ func GetConfigForTenant(tenantID, modelID string) (usage.ModelConfigRow, bool) {
+ 	return usage.GetModelConfigForTenant(tenantID, strings.TrimSpace(modelID))
+ }
+ 
++// NormalizeModelKey renders a model ID in the form used as a map key by the
++// disabled-model lookups below.
++func NormalizeModelKey(modelID string) string {
++	return strings.ToLower(strings.TrimSpace(modelID))
++}
++
++// DisabledModelIDs returns the set of models the operator switched off for the
++// system tenant.
++func DisabledModelIDs() map[string]struct{} { return DisabledModelIDsForTenant("") }
++
++// DisabledModelIDsForTenant returns the set of models the operator switched off,
++// keyed by NormalizeModelKey.
++//
++// A model_configs row carries the operator's intent for one model. Every other
++// consumer of Enabled only reads it additively — "should this row contribute a
++// model to the catalog?" — which silently makes the toggle a no-op for any
++// model the static registry already provides. Disabling such a model left it
++// listed in the management catalog, listed in /v1/models, and fully callable.
++//
++// This set is the subtractive half: callers remove these IDs from whatever they
++// are about to serve, so "disabled" means the same thing everywhere.
++func DisabledModelIDsForTenant(tenantID string) map[string]struct{} {
++	rows := usage.ListModelConfigsForTenant(tenantID)
++	disabled := make(map[string]struct{})
++	for _, row := range rows {
++		if row.Enabled {
++			continue
++		}
++		if key := NormalizeModelKey(row.ModelID); key != "" {
++			disabled[key] = struct{}{}
++		}
++	}
++	return disabled
++}
++
++// IsModelDisabledForTenant reports whether one model is switched off.
++func IsModelDisabledForTenant(tenantID, modelID string) bool {
++	key := NormalizeModelKey(modelID)
++	if key == "" {
++		return false
++	}
++	row, ok := usage.GetModelConfigForTenant(tenantID, strings.TrimSpace(modelID))
++	if !ok {
++		return false
++	}
++	return !row.Enabled
++}
++
+ func UpsertConfig(input UpsertConfigInput) (usage.ModelConfigRow, error) {
+ 	return UpsertConfigForTenant("", input)
+ }
 diff --git a/internal/registry/model_definitions.go b/internal/registry/model_definitions.go
 index aac63621..1ff0e09e 100644
 --- a/internal/registry/model_definitions.go
@@ -328,6 +1155,226 @@ index 00000000..e1cbb995
 +	out = append(out, base...)
 +	return out
 +}
+diff --git a/internal/runtime/executor/antigravity_count_tokens.go b/internal/runtime/executor/antigravity_count_tokens.go
+index 7fd0ac7a..9ea40dfe 100644
+--- a/internal/runtime/executor/antigravity_count_tokens.go
++++ b/internal/runtime/executor/antigravity_count_tokens.go
+@@ -92,6 +92,14 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
+ 		// switch — 429 is an account-level RESOURCE_EXHAUSTED signal, not a
+ 		// host-specific hiccup: see antigravity_executor.go for the
+ 		// production trace that motivated dropping the host fallback.
++		//
++		// The location gate is the opposite: it is a per-attempt draw
++		// (antigravityShouldRetryHost), so the other daily host is worth a
++		// try before the rejection reaches the client.
++		if antigravityShouldRetryHost(httpResp.StatusCode, bodyBytes) && idx+1 < len(baseURLs) {
++			log.Debugf("antigravity executor: retryable upstream status %d on base url %s, retrying with fallback base url: %s", httpResp.StatusCode, baseURL, baseURLs[idx+1])
++			continue
++		}
+ 		sErr := statusErr{code: httpResp.StatusCode, msg: string(bodyBytes)}
+ 		if httpResp.StatusCode == http.StatusTooManyRequests {
+ 			if retryAfter, parseErr := parseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
+diff --git a/internal/runtime/executor/antigravity_executor.go b/internal/runtime/executor/antigravity_executor.go
+index 0e1698a8..00265d68 100644
+--- a/internal/runtime/executor/antigravity_executor.go
++++ b/internal/runtime/executor/antigravity_executor.go
+@@ -221,14 +221,19 @@ attemptLoop:
+ 				// attempt on an account that's already known to be limited,
+ 				// leaving the outer selector fewer retries to reach a
+ 				// different, healthy account.
+-				if antigravityShouldRetryNoCapacity(httpResp.StatusCode, bodyBytes) {
++				//
++				// The location gate is the opposite: it is a per-attempt draw
++				// (antigravityShouldRetryHost), so the next host and the next
++				// attempt are both worth taking before failing the client.
++				if antigravityShouldRetryNoCapacity(httpResp.StatusCode, bodyBytes) ||
++					antigravityShouldRetryHost(httpResp.StatusCode, bodyBytes) {
+ 					if idx+1 < len(baseURLs) {
+-						log.Debugf("antigravity executor: no capacity on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
++						log.Debugf("antigravity executor: retryable upstream status %d on base url %s, retrying with fallback base url: %s", httpResp.StatusCode, baseURL, baseURLs[idx+1])
+ 						continue
+ 					}
+ 					if attempt+1 < attempts {
+ 						delay := antigravityNoCapacityRetryDelay(attempt)
+-						log.Debugf("antigravity executor: no capacity for model %s, retrying in %s (attempt %d/%d)", execCtx.BaseModel, delay, attempt+1, attempts)
++						log.Debugf("antigravity executor: retryable upstream status %d for model %s, retrying in %s (attempt %d/%d)", httpResp.StatusCode, execCtx.BaseModel, delay, attempt+1, attempts)
+ 						if errWait := antigravityWait(ctx, delay); errWait != nil {
+ 							return nil, errWait
+ 						}
+diff --git a/internal/runtime/executor/antigravity_host_fallback_test.go b/internal/runtime/executor/antigravity_host_fallback_test.go
+new file mode 100644
+index 00000000..0a3f0575
+--- /dev/null
++++ b/internal/runtime/executor/antigravity_host_fallback_test.go
+@@ -0,0 +1,94 @@
++package executor
++
++import (
++	"net/http"
++	"os"
++	"strings"
++	"testing"
++)
++
++// The sandbox host rejects some callers with a location gate while the daily and
++// production hosts serve the identical request. That response is about the exit
++// host, not about the request, so the executor has to move on to the next host
++// instead of failing the client.
++func TestAntigravityShouldRetryHost(t *testing.T) {
++	locationBody := []byte(`{"error":{"code":400,"message":"User location is not supported for the API use.","status":"FAILED_PRECONDITION"}}`)
++	cases := []struct {
++		name   string
++		status int
++		body   []byte
++		want   bool
++	}{
++		{"location rejection", http.StatusBadRequest, locationBody, true},
++		{"location rejection lowercased", http.StatusBadRequest, []byte("user location is not supported for the api use"), true},
++		{"empty body", http.StatusBadRequest, nil, false},
++		{"other 400", http.StatusBadRequest, []byte(`{"error":{"message":"Request contains an invalid argument."}}`), false},
++		{"invalid api key", http.StatusUnauthorized, locationBody, false},
++		{"server error", http.StatusInternalServerError, locationBody, false},
++		{"rate limited", http.StatusTooManyRequests, locationBody, false},
++	}
++	for _, testCase := range cases {
++		t.Run(testCase.name, func(t *testing.T) {
++			if got := antigravityShouldRetryHost(testCase.status, testCase.body); got != testCase.want {
++				t.Fatalf("antigravityShouldRetryHost(%d, %q) = %v, want %v", testCase.status, testCase.body, got, testCase.want)
++			}
++		})
++	}
++}
++
++// A host that only ever answers `429 quota` can never serve the caller that just
++// got gated, and the 429 is read as an account-level signal that trips the
++// credential cool-down for the requests that follow. Measured: production
++// answered 6/6 requests with RESOURCE_EXHAUSTED for this free-tier account.
++func TestAntigravityBaseURLFallbackOrderExcludesProduction(t *testing.T) {
++	baseURLs := antigravityBaseURLFallbackOrder(nil)
++	if len(baseURLs) != 2 {
++		t.Fatalf("fallback hosts = %#v, want the two daily hosts", baseURLs)
++	}
++	if baseURLs[0] != antigravitySandboxBaseURLDaily {
++		t.Fatalf("first host = %q, want the sandbox host (throttling order is deliberate)", baseURLs[0])
++	}
++	if baseURLs[1] != antigravityBaseURLDaily {
++		t.Fatalf("second host = %q, want the daily host %q", baseURLs[1], antigravityBaseURLDaily)
++	}
++	for _, baseURL := range baseURLs {
++		if baseURL == antigravityBaseURLProd {
++			t.Fatalf("production host %q must stay out of the fallback order", antigravityBaseURLProd)
++		}
++	}
++}
++
++// The location gate has to share the retry branch with the capacity check: the
++// gate is a per-attempt draw, so a second host *and* a second attempt are both
++// worth taking before the rejection is handed to the client.
++func TestAntigravityContentPathsRetryOnLocationGate(t *testing.T) {
++	for _, path := range []string{"antigravity_executor.go", "antigravity_nonstream.go", "antigravity_count_tokens.go"} {
++		source, err := os.ReadFile(path)
++		if err != nil {
++			t.Fatalf("read %s: %v", path, err)
++		}
++		body := string(source)
++		hostCheck := strings.Index(body, "antigravityShouldRetryHost(httpResp.StatusCode, bodyBytes)")
++		if hostCheck < 0 {
++			t.Errorf("%s does not retry on the location gate", path)
++			continue
++		}
++		statusErr := strings.Index(body[hostCheck:], "statusErr{code: httpResp.StatusCode")
++		if statusErr < 0 {
++			t.Errorf("%s: the gate check is not followed by the status error it must pre-empt", path)
++			continue
++		}
++		between := body[hostCheck : hostCheck+statusErr]
++		if !strings.Contains(between, "continue") {
++			t.Errorf("%s checks the gate without continuing to the next base URL or attempt", path)
++		}
++		// Both predicates must be in the same condition, so the gate inherits the
++		// existing next-host-then-next-attempt ladder.
++		if path != "antigravity_count_tokens.go" {
++			condition := body[strings.LastIndex(body[:hostCheck], "if "):hostCheck]
++			if !strings.Contains(condition, "antigravityShouldRetryNoCapacity(httpResp.StatusCode, bodyBytes)") {
++				t.Errorf("%s: the gate check does not share the retryable-status condition", path)
++			}
++		}
++	}
++}
+diff --git a/internal/runtime/executor/antigravity_nonstream.go b/internal/runtime/executor/antigravity_nonstream.go
+index e938960b..27f88c64 100644
+--- a/internal/runtime/executor/antigravity_nonstream.go
++++ b/internal/runtime/executor/antigravity_nonstream.go
+@@ -115,14 +115,19 @@ attemptLoop:
+ 				// 429 is an account-level RESOURCE_EXHAUSTED signal, not a
+ 				// host-specific hiccup: see antigravity_executor.go for the
+ 				// production trace that motivated dropping this fallback.
+-				if antigravityShouldRetryNoCapacity(httpResp.StatusCode, bodyBytes) {
++				//
++				// The location gate is the opposite: it is a per-attempt draw
++				// (antigravityShouldRetryHost), so the next host and the next
++				// attempt are both worth taking before failing the client.
++				if antigravityShouldRetryNoCapacity(httpResp.StatusCode, bodyBytes) ||
++					antigravityShouldRetryHost(httpResp.StatusCode, bodyBytes) {
+ 					if idx+1 < len(baseURLs) {
+-						log.Debugf("antigravity executor: no capacity on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
++						log.Debugf("antigravity executor: retryable upstream status %d on base url %s, retrying with fallback base url: %s", httpResp.StatusCode, baseURL, baseURLs[idx+1])
+ 						continue
+ 					}
+ 					if attempt+1 < attempts {
+ 						delay := antigravityNoCapacityRetryDelay(attempt)
+-						log.Debugf("antigravity executor: no capacity for model %s, retrying in %s (attempt %d/%d)", execCtx.BaseModel, delay, attempt+1, attempts)
++						log.Debugf("antigravity executor: retryable upstream status %d for model %s, retrying in %s (attempt %d/%d)", httpResp.StatusCode, execCtx.BaseModel, delay, attempt+1, attempts)
+ 						if errWait := antigravityWait(ctx, delay); errWait != nil {
+ 							return resp, errWait
+ 						}
+diff --git a/internal/runtime/executor/antigravity_request.go b/internal/runtime/executor/antigravity_request.go
+index 8889234e..94a56d88 100644
+--- a/internal/runtime/executor/antigravity_request.go
++++ b/internal/runtime/executor/antigravity_request.go
+@@ -221,6 +221,25 @@ func antigravityShouldRetryNoCapacity(statusCode int, body []byte) bool {
+ 	return strings.Contains(msg, "no capacity available")
+ }
+ 
++// antigravityShouldRetryHost reports whether an upstream response is a verdict on
++// this attempt rather than on the request itself.
++//
++// The daily hosts answer a share of otherwise-valid requests with
++// `400 FAILED_PRECONDITION: User location is not supported for the API use.`
++// Measured on the live deployment, calling Google directly with the account's own
++// token so the relay was out of the picture: 10 sequential requests produced 5-7
++// of those, split across both hosts, with the same project id that
++// `loadCodeAssist` reports, and the same host served the identical request
++// minutes later. The gate is a per-attempt draw, so it is worth another host and
++// another attempt — treating it as request-fatal (the previous behaviour) turned
++// it into a user-visible failure instead.
++func antigravityShouldRetryHost(statusCode int, body []byte) bool {
++	if statusCode != http.StatusBadRequest || len(body) == 0 {
++		return false
++	}
++	return strings.Contains(strings.ToLower(string(body)), "user location is not supported")
++}
++
+ func antigravityNoCapacityRetryDelay(attempt int) time.Duration {
+ 	if attempt < 0 {
+ 		attempt = 0
+@@ -254,10 +273,15 @@ func antigravityBaseURLFallbackOrder(auth *cliproxyauth.Auth) []string {
+ 	// every 429 it returns costs a retry and risks being read as an exhausted
+ 	// quota. Production logs showed the daily host rate-limiting requests that
+ 	// the sandbox host then served without complaint.
++	//
++	// Production stays out on purpose: it answers every request for a free-tier
++	// account with `429 Resource has been exhausted` (6/6 measured), and a 429 is
++	// read as an account-level signal that trips the credential cool-down — which
++	// then fails the requests that follow. A host that only ever says "quota" can
++	// never serve the caller that just got gated.
+ 	return []string{
+ 		antigravitySandboxBaseURLDaily,
+ 		antigravityBaseURLDaily,
+-		// antigravityBaseURLProd,
+ 	}
+ }
+ 
 diff --git a/internal/runtime/executor/claude_transport.go b/internal/runtime/executor/claude_transport.go
 index 9c7b165c..8cfec76c 100644
 --- a/internal/runtime/executor/claude_transport.go
@@ -465,3 +1512,268 @@ index e77b09e1..5bfb8e78 100644
  			out = append(out, emitEvent("response.output_item.done", final))
  			st.InTextBlock = false
  		} else if st.InFuncBlock {
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+index 6bb5d5e4..ed09e50c 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+@@ -3,6 +3,7 @@ package responses
+ import (
+ 	"strings"
+ 
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
+ 	"github.com/tidwall/gjson"
+ 	"github.com/tidwall/sjson"
+@@ -13,9 +14,8 @@ const geminiResponsesThoughtSignature = "skip_thought_signature_validator"
+ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte, stream bool) []byte {
+ 	rawJSON := inputRawJSON
+ 
+-	// Note: modelName and stream parameters are part of the fixed method signature
+-	_ = modelName // Unused but required by interface
+-	_ = stream    // Unused but required by interface
++	// Note: stream is part of the fixed method signature.
++	_ = stream // Unused but required by interface
+ 
+ 	// Base Gemini API template (do not include thinkingConfig by default)
+ 	out := `{"contents":[]}`
+@@ -329,10 +329,30 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
+ 				out, _ = sjson.SetRaw(out, "contents.-1", functionContent)
+ 
+ 			case "reasoning":
++				// A Gemini thinking part must carry a signature, and the Antigravity
++				// Claude models enforce that on the wire: replaying an unsigned thought
++				// part is rejected with
++				// `messages.N.content.M.thinking.signature: Field required`.
++				//
++				// Codex replays its own reasoning items with an empty
++				// `encrypted_content`, so the client-supplied value is usually useless.
++				// Fall back to the signature the response side cached for this exact
++				// thinking text (the same cache the Claude Code path uses) and drop the
++				// part when neither source has one — an absent thinking block is always
++				// accepted, an unsigned one never is.
++				thoughtText := item.Get("summary.0.text").String()
++				thoughtSignature := strings.TrimSpace(item.Get("encrypted_content").String())
++				if thoughtSignature == "" && modelName != "" {
++					thoughtSignature = cache.GetCachedSignature(modelName, thoughtText)
++				}
++				if thoughtSignature == "" {
++					break
++				}
++
+ 				thoughtContent := `{"role":"model","parts":[]}`
+ 				thought := `{"text":"","thoughtSignature":"","thought":true}`
+-				thought, _ = sjson.Set(thought, "text", item.Get("summary.0.text").String())
+-				thought, _ = sjson.Set(thought, "thoughtSignature", item.Get("encrypted_content").String())
++				thought, _ = sjson.Set(thought, "text", thoughtText)
++				thought, _ = sjson.Set(thought, "thoughtSignature", thoughtSignature)
+ 
+ 				thoughtContent, _ = sjson.SetRaw(thoughtContent, "parts.-1", thought)
+ 				out, _ = sjson.SetRaw(out, "contents.-1", thoughtContent)
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+new file mode 100644
+index 00000000..0501e276
+--- /dev/null
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+@@ -0,0 +1,118 @@
++package responses
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
++	"github.com/tidwall/gjson"
++)
++
++// Long enough to pass cache.MinValidSignatureLen, which CacheSignature enforces.
++const reasoningReplaySignature = "RXE0RENrZ0lDeEFDR0FJcVFOZDdjUzlleGFuRktRdFcvSzNyZ2MvWDNCcDQ4RmxSbGxOWUlOVU5kR1l1UHMrMGdkMVp0Vkg3ekdKU0g4YVljc2JjN3lNK0FrdGpTNUdqamI4T3Z0VVNETzdQd3pmcFhUOGl3U3hXUEJvTVFRQ09mWTFyMEtTWGZxUUlJakFqdmFGWk83RW1XRlBKckJVOVpkYzdDKw=="
++
++func reasoningReplayRequest(modelName, thinkingText, encryptedContent string) []byte {
++	return []byte(`{
++		"model": "` + modelName + `",
++		"input": [
++			{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
++			{"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "` + thinkingText + `"}], "content": [], "encrypted_content": "` + encryptedContent + `"},
++			{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
++		]
++	}`)
++}
++
++func thoughtParts(raw []byte) []gjson.Result {
++	var parts []gjson.Result
++	gjson.GetBytes(raw, "contents").ForEach(func(_, content gjson.Result) bool {
++		content.Get("parts").ForEach(func(_, part gjson.Result) bool {
++			if part.Get("thought").Bool() {
++				parts = append(parts, part)
++			}
++			return true
++		})
++		return true
++	})
++	return parts
++}
++
++// Codex replays its own reasoning items with an empty encrypted_content. An
++// unsigned thinking part is rejected by the Antigravity Claude models with
++// `messages.N.content.M.thinking.signature: Field required`, so it must not be
++// forwarded at all.
++func TestReasoningReplayDropsUnsignedThoughtPart(t *testing.T) {
++	const thinkingText = "unsigned-reasoning-replay-must-be-dropped"
++	out := ConvertOpenAIResponsesRequestToGemini(
++		"claude-opus-4-6-thinking",
++		reasoningReplayRequest("claude-opus-4-6-thinking", thinkingText, ""),
++		true,
++	)
++	if parts := thoughtParts(out); len(parts) != 0 {
++		t.Fatalf("unsigned thinking part was forwarded: %#v", parts)
++	}
++	// The rest of the conversation still has to be translated.
++	if got := gjson.GetBytes(out, "contents.#").Int(); got != 2 {
++		t.Fatalf("contents = %d, want the user and assistant messages only", got)
++	}
++}
++
++// The response side caches the upstream signature for the thinking text, which is
++// what makes a signed replay possible when the client cannot supply one.
++func TestReasoningReplayUsesCachedSignature(t *testing.T) {
++	const thinkingText = "cached-signature-reasoning-replay"
++	cache.CacheSignature("claude-opus-4-6-thinking", thinkingText, reasoningReplaySignature)
++
++	out := ConvertOpenAIResponsesRequestToGemini(
++		"claude-opus-4-6-thinking",
++		reasoningReplayRequest("claude-opus-4-6-thinking", thinkingText, ""),
++		true,
++	)
++	parts := thoughtParts(out)
++	if len(parts) != 1 {
++		t.Fatalf("thinking parts = %d, want 1", len(parts))
++	}
++	if got := parts[0].Get("thoughtSignature").String(); got != reasoningReplaySignature {
++		t.Fatalf("thoughtSignature = %q, want the cached signature", got)
++	}
++	if got := parts[0].Get("text").String(); got != thinkingText {
++		t.Fatalf("thought text = %q, want %q", got, thinkingText)
++	}
++}
++
++// A client that does supply a signature keeps winning over the cache.
++func TestReasoningReplayPrefersClientSignature(t *testing.T) {
++	const thinkingText = "client-signature-wins"
++	clientSignature := reasoningReplaySignature + "client"
++	cache.CacheSignature("claude-opus-4-6-thinking", thinkingText, reasoningReplaySignature)
++
++	out := ConvertOpenAIResponsesRequestToGemini(
++		"claude-opus-4-6-thinking",
++		reasoningReplayRequest("claude-opus-4-6-thinking", thinkingText, clientSignature),
++		true,
++	)
++	parts := thoughtParts(out)
++	if len(parts) != 1 {
++		t.Fatalf("thinking parts = %d, want 1", len(parts))
++	}
++	if got := parts[0].Get("thoughtSignature").String(); got != clientSignature {
++		t.Fatalf("thoughtSignature = %q, want the client signature %q", got, clientSignature)
++	}
++}
++
++// Gemini is the one family with a sanctioned escape hatch, and the cache returns
++// it on a miss — so Gemini replays keep their thinking part unchanged.
++func TestReasoningReplayKeepsGeminiThinkingPartViaSentinel(t *testing.T) {
++	const thinkingText = "gemini-replay-keeps-thinking-part"
++	out := ConvertOpenAIResponsesRequestToGemini(
++		"gemini-3.1-pro-low",
++		reasoningReplayRequest("gemini-3.1-pro-low", thinkingText, ""),
++		true,
++	)
++	parts := thoughtParts(out)
++	if len(parts) != 1 {
++		t.Fatalf("thinking parts = %d, want 1", len(parts))
++	}
++	if got := parts[0].Get("thoughtSignature").String(); !strings.Contains(got, "skip_thought_signature_validator") {
++		t.Fatalf("thoughtSignature = %q, want the Gemini sentinel", got)
++	}
++}
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
+index 73609be7..4f2968df 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
+@@ -8,6 +8,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+ 	"github.com/tidwall/gjson"
+ 	"github.com/tidwall/sjson"
+ )
+@@ -135,6 +136,11 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
+ 			return
+ 		}
+ 		full := st.ReasoningBuf.String()
++		// Remember the signature for this thinking text: the request side re-attaches
++		// it when a client replays the reasoning item without one (Codex sends an
++		// empty encrypted_content). Without it the replayed thought part is unsigned
++		// and Antigravity's Claude models reject the whole request.
++		cache.CacheSignature(modelName, full, st.ReasoningEnc)
+ 		textDone := `{"type":"response.reasoning_summary_text.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"text":""}`
+ 		textDone, _ = sjson.Set(textDone, "sequence_number", nextSeq())
+ 		textDone, _ = sjson.Set(textDone, "item_id", st.ReasoningItemID)
+@@ -561,7 +567,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
+ }
+ 
+ // ConvertGeminiResponseToOpenAIResponsesNonStream aggregates Gemini response JSON into a single OpenAI Responses JSON object.
+-func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
++func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
+ 	root := gjson.ParseBytes(rawJSON)
+ 	root = unwrapGeminiResponseRoot(root)
+ 
+@@ -714,6 +720,10 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
+ 
+ 	// Reasoning output item
+ 	if reasoningText.Len() > 0 || reasoningEncrypted != "" {
++		// Same signature cache as the streaming path: the request side needs it to
++		// re-attach a signature when the client replays this reasoning item without
++		// one.
++		cache.CacheSignature(modelName, reasoningText.String(), reasoningEncrypted)
+ 		rid := strings.TrimPrefix(id, "resp_")
+ 		itemJSON := `{"id":"","type":"reasoning","encrypted_content":""}`
+ 		itemJSON, _ = sjson.Set(itemJSON, "id", fmt.Sprintf("rs_%s", rid))
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_response_test.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_response_test.go
+index 9899c594..5c3da634 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_response_test.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_response_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"strings"
+ 	"testing"
+ 
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+ 	"github.com/tidwall/gjson"
+ )
+ 
+@@ -194,6 +195,27 @@ func TestConvertGeminiResponseToOpenAIResponses_ReasoningEncryptedContent(t *tes
+ 	}
+ }
+ 
++// The request side can only re-attach a signature it can look up by thinking text,
++// so the response path has to publish it. Codex replays reasoning items with an
++// empty encrypted_content, which makes this cache the only signature source.
++func TestConvertGeminiResponseToOpenAIResponsesCachesThinkingSignature(t *testing.T) {
++	sig := "RXE0RENrZ0lDeEFDR0FJcVFOZDdjUzlleGFuRktRdFcvSzNyZ2MvWDNCcDQ4RmxSbGxOWUlOVU5kR1l1UHMrMGdkMVp0Vkg3ekdKU0g4YVljc2JjN3lNK0FrdGpTNUdqamI4T3Z0VVNETzdQd3pmcFhUOGl3U3hXUEJvTVFRQ09mWTFyMEtTWGZxUUlJakFqdmFGWk83RW1XRlBKckJVOVpkYzdDKw=="
++	text := "cached-thinking-signature-probe"
++	in := []string{
++		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"thoughtSignature":"` + sig + `","text":"` + text + `"}]}}],"modelVersion":"claude-opus-4-6-thinking","responseId":"req_vrtx_cache"},"traceId":"t1"}`,
++		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],"modelVersion":"claude-opus-4-6-thinking","responseId":"req_vrtx_cache"},"traceId":"t1"}`,
++	}
++
++	var param any
++	for _, line := range in {
++		ConvertGeminiResponseToOpenAIResponses(context.Background(), "claude-opus-4-6-thinking", nil, nil, []byte(line), &param)
++	}
++
++	if got := cache.GetCachedSignature("claude-opus-4-6-thinking", text); got != sig {
++		t.Fatalf("cached signature = %q, want %q", got, sig)
++	}
++}
++
+ func TestConvertGeminiResponseToOpenAIResponses_FunctionCallEventOrder(t *testing.T) {
+ 	in := []string{
+ 		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"tool0"}}]}}],"modelVersion":"test-model","responseId":"req_vrtx_1"},"traceId":"t1"}`,

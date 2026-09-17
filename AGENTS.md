@@ -23,6 +23,7 @@ install.py                          幂等安装入口
 pi/settings.json                    合并进 ~/.pi/agent/settings.json 的键
 pi/extensions/collapse-tool-output.ts   软链到 ~/.pi/agent/extensions/
 pi/patches/apply-billing-header.py      软链到 ~/.pi/patches/，安装时执行一次
+pi/patches/apply-cliproxyapi-maxtokens.py  改 CLIProxyAPI 插件产物，手动装
 pi/auth.example.json                凭据结构示例（占位符）
 pi/models-store.example.json        模型表快照，默认不装
 ```
