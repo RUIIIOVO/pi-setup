@@ -1,5 +1,5 @@
 diff --git a/docs/internal-review/backend-structure-allowlist.json b/docs/internal-review/backend-structure-allowlist.json
-index ad976c51..fe601438 100644
+index ad976c51..3771ad20 100644
 --- a/docs/internal-review/backend-structure-allowlist.json
 +++ b/docs/internal-review/backend-structure-allowlist.json
 @@ -26,7 +26,7 @@
@@ -7,7 +7,7 @@ index ad976c51..fe601438 100644
        {
          "path": "internal/management/modelcatalog/availability.go",
 -        "max_lines": 987
-+        "max_lines": 977
++        "max_lines": 964
        },
        {
          "path": "internal/management/settings/providers/provider_keys_extended.go",
@@ -672,18 +672,47 @@ index 3aa3ddd9..08cc3da5 100644
  	}
  	if got.StainlessPackageVersion != "0.94.0" {
 diff --git a/internal/management/modelcatalog/availability.go b/internal/management/modelcatalog/availability.go
-index 7fe922f5..a666383d 100644
+index 7fe922f5..446586bb 100644
 --- a/internal/management/modelcatalog/availability.go
 +++ b/internal/management/modelcatalog/availability.go
-@@ -80,6 +80,7 @@ func (s *Service) ConfiguredAvailability(allowedChannelsRaw, allowedGroupsRaw st
+@@ -80,6 +80,14 @@ func (s *Service) ConfiguredAvailability(allowedChannelsRaw, allowedGroupsRaw st
  	if !filterOpts.IgnoreGroupAllowedModels {
  		allModels = s.filterModelsByRoutingAllowedModels(allModels, allowedGroupsRaw)
  	}
-+	allModels = dropDisabledModels(allModels, s.tenantID)
++	// Disabled models deliberately stay in this list. This is the operator's own
++	// catalog view (GET /models/configured-availability): the panel intersects the
++	// model_configs rows with it, so dropping a disabled model here removes the row
++	// that carries its toggle — the model vanishes from the page and can never be
++	// switched back on. The subtraction belongs to the surfaces that serve models:
++	// Models() for the plaza and the channel-group editor, PortalVisibleModelIDs
++	// for pi and the public catalog, dropDisabledCatalogModels for /v1/models, and
++	// the request path itself.
  
  	configByID, pricingByID := pricingLookupMapsForTenant(s.tenantID)
  	data := make([]map[string]any, 0, len(allModels))
-@@ -162,6 +163,7 @@ func (s *Service) Models(allowedChannelsRaw, allowedGroupsRaw string, opts ...Av
+@@ -91,9 +99,10 @@ func (s *Service) ConfiguredAvailability(allowedChannelsRaw, allowedGroupsRaw st
+ 			continue
+ 		}
+ 		entry := map[string]any{
+-			"id":     id,
+-			"object": "model",
+-			"source": "registry",
++			"id":      id,
++			"object":  "model",
++			"source":  "registry",
++			"enabled": true,
+ 		}
+ 		if src, _ := model["source"].(string); strings.TrimSpace(src) != "" {
+ 			entry["source"] = src
+@@ -111,6 +120,7 @@ func (s *Service) ConfiguredAvailability(allowedChannelsRaw, allowedGroupsRaw st
+ 		}
+ 		if row, ok := configByID[strings.ToLower(id)]; ok {
+ 			attachModelConfigCapabilities(entry, row)
++			entry["enabled"] = row.Enabled
+ 			if row.Description != "" {
+ 				entry["description"] = row.Description
+ 			}
+@@ -162,6 +172,7 @@ func (s *Service) Models(allowedChannelsRaw, allowedGroupsRaw string, opts ...Av
  	if !filterOpts.IgnoreGroupAllowedModels {
  		allModels = s.filterModelsByRoutingAllowedModels(allModels, allowedGroupsRaw)
  	}
@@ -691,7 +720,36 @@ index 7fe922f5..a666383d 100644
  
  	configByID, pricingByID := pricingLookupMapsForTenant(s.tenantID)
  	filteredModels := make([]map[string]any, len(allModels))
-@@ -728,18 +730,6 @@ func withDefaultMappedOwnerRows(
+@@ -661,28 +672,6 @@ func shouldUseDefaultMappedOwnerScope(allowedChannelsRaw, allowedGroupsRaw strin
+ 	return strings.TrimSpace(allowedChannelsRaw) == "" && strings.TrimSpace(allowedGroupsRaw) == ""
+ }
+ 
+-func (s *Service) defaultMappedOwnerRows() ([]usage.ModelConfigRow, map[string]bool, map[string]bool, bool) {
+-	ownerKeys := s.defaultMappedOwnerKeys()
+-	if len(ownerKeys) == 0 {
+-		return nil, nil, nil, false
+-	}
+-	rows := modelconfigsettings.ListAllConfigsForTenant(s.tenantID)
+-	out := make([]usage.ModelConfigRow, 0, len(rows))
+-	configuredModelKeys := make(map[string]bool, len(rows))
+-	for _, row := range rows {
+-		if !row.Enabled {
+-			continue
+-		}
+-		if key := strings.ToLower(strings.TrimSpace(row.ModelID)); key != "" {
+-			configuredModelKeys[key] = true
+-		}
+-		if ownerKeys[normalizeModelOwnerKey(row.OwnedBy)] {
+-			out = append(out, row)
+-		}
+-	}
+-	return out, ownerKeys, configuredModelKeys, true
+-}
+-
+ func withDefaultMappedOwnerRows(
+ 	modelRegistry *registry.ModelRegistry,
+ 	models []map[string]any,
+@@ -728,18 +717,6 @@ func withDefaultMappedOwnerRows(
  	return out
  }
  
@@ -712,10 +770,10 @@ index 7fe922f5..a666383d 100644
  	modelID string,
 diff --git a/internal/management/modelcatalog/availability_model_enablement.go b/internal/management/modelcatalog/availability_model_enablement.go
 new file mode 100644
-index 00000000..66cb7780
+index 00000000..b9c75781
 --- /dev/null
 +++ b/internal/management/modelcatalog/availability_model_enablement.go
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,98 @@
 +package modelcatalog
 +
 +// Model enablement scoping: which catalog models an operator's enable/disable
@@ -755,6 +813,28 @@ index 00000000..66cb7780
 +	return out
 +}
 +
++// dropDisabledModelIDs removes every model the operator switched off from an ID
++// set. ConfiguredAvailability keeps disabled models so the management catalog can
++// still render their toggle, which makes this the step every serving surface
++// derived from it has to apply.
++func dropDisabledModelIDs(ids map[string]struct{}, tenantID string) map[string]struct{} {
++	if len(ids) == 0 {
++		return ids
++	}
++	disabled := modelconfigsettings.DisabledModelIDsForTenant(tenantID)
++	if len(disabled) == 0 {
++		return ids
++	}
++	out := make(map[string]struct{}, len(ids))
++	for id := range ids {
++		if _, off := disabled[modelconfigsettings.NormalizeModelKey(id)]; off {
++			continue
++		}
++		out[id] = struct{}{}
++	}
++	return out
++}
++
 +func mappedOwnerRowModelKeys(rows []usage.ModelConfigRow, ownerKeys map[string]bool) map[string]bool {
 +	out := make(map[string]bool, len(rows))
 +	for _, row := range rows {
@@ -766,18 +846,48 @@ index 00000000..66cb7780
 +	}
 +	return out
 +}
++
++// defaultMappedOwnerRows returns the config rows the operator has switched on
++// for the default owner scope, plus the key sets the caller needs to merge them.
++// It lives here because the Enabled check is the additive half of the same
++// toggle dropDisabledModels subtracts with.
++func (s *Service) defaultMappedOwnerRows() ([]usage.ModelConfigRow, map[string]bool, map[string]bool, bool) {
++	ownerKeys := s.defaultMappedOwnerKeys()
++	if len(ownerKeys) == 0 {
++		return nil, nil, nil, false
++	}
++	rows := modelconfigsettings.ListAllConfigsForTenant(s.tenantID)
++	out := make([]usage.ModelConfigRow, 0, len(rows))
++	configuredModelKeys := make(map[string]bool, len(rows))
++	for _, row := range rows {
++		if !row.Enabled {
++			continue
++		}
++		if key := strings.ToLower(strings.TrimSpace(row.ModelID)); key != "" {
++			configuredModelKeys[key] = true
++		}
++		if ownerKeys[normalizeModelOwnerKey(row.OwnedBy)] {
++			out = append(out, row)
++		}
++	}
++	return out, ownerKeys, configuredModelKeys, true
++}
 diff --git a/internal/management/modelcatalog/availability_model_enablement_test.go b/internal/management/modelcatalog/availability_model_enablement_test.go
 new file mode 100644
-index 00000000..c564694d
+index 00000000..dbf5e7ff
 --- /dev/null
 +++ b/internal/management/modelcatalog/availability_model_enablement_test.go
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,178 @@
 +package modelcatalog
 +
 +import (
++	"context"
 +	"testing"
 +
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 +	modelconfigsettings "github.com/router-for-me/CLIProxyAPI/v6/internal/management/settings/modelconfig"
++	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 +)
 +
 +// The management catalog is built from the static registry, which never looked
@@ -866,6 +976,105 @@ index 00000000..c564694d
 +		t.Fatalf("dropDisabledModels(nil) = %v, want empty", modelIDsOf(got))
 +	}
 +}
++
++func TestDropDisabledModelIDsRemovesDisabledEntries(t *testing.T) {
++	initModelCatalogTestDB(t)
++
++	seedEnablement(t, "claude-opus-4-6", false)
++	seedEnablement(t, "claude-opus-5", true)
++
++	ids := map[string]struct{}{"claude-opus-4-6": {}, "claude-opus-5": {}, "claude-fable-5-1": {}}
++	got := dropDisabledModelIDs(ids, "")
++
++	if _, present := got["claude-opus-4-6"]; present {
++		t.Fatal("disabled model survived the ID filter")
++	}
++	for _, want := range []string{"claude-opus-5", "claude-fable-5-1"} {
++		if _, present := got[want]; !present {
++			t.Fatalf("%q was dropped, want it kept", want)
++		}
++	}
++}
++
++// The management catalog page intersects the model_configs rows with configured
++// availability. Dropping a disabled model from availability therefore removed the
++// row carrying its toggle: the model disappeared from the page entirely and could
++// never be switched back on.
++func TestConfiguredAvailabilityKeepsDisabledModelsForTheOperator(t *testing.T) {
++	initModelCatalogTestDB(t)
++
++	const (
++		clientID     = "enablement-visibility-auth"
++		disabledID   = "enablement-visibility-disabled"
++		enabledModel = "enablement-visibility-enabled"
++	)
++
++	modelRegistry := registry.GetGlobalRegistry()
++	modelRegistry.UnregisterClient(clientID)
++	t.Cleanup(func() { modelRegistry.UnregisterClient(clientID) })
++	modelRegistry.RegisterClient(clientID, "codex", []*registry.ModelInfo{
++		{ID: disabledID, Object: "model", OwnedBy: "openai"},
++		{ID: enabledModel, Object: "model", OwnedBy: "openai"},
++	})
++
++	manager := coreauth.NewManager(nil, nil, nil)
++	if _, err := manager.Register(context.Background(), &coreauth.Auth{
++		ID: clientID, Provider: "codex", Label: "Codex", Status: coreauth.StatusActive,
++	}); err != nil {
++		t.Fatalf("register auth: %v", err)
++	}
++
++	seedEnablement(t, disabledID, false)
++	seedEnablement(t, enabledModel, true)
++
++	service := New(&config.Config{}, manager)
++	data, ok := service.ConfiguredAvailability("", "")["data"].([]map[string]any)
++	if !ok {
++		t.Fatal("configured availability returned no data slice")
++	}
++
++	var found map[string]any
++	for _, item := range data {
++		if item["id"] == disabledID {
++			found = item
++			break
++		}
++	}
++	if found == nil {
++		t.Fatalf("disabled model %q is missing from the operator catalog; ids=%v", disabledID, modelIDsOf(data))
++	}
++	if found["enabled"] != false {
++		t.Fatalf("disabled model entry enabled = %#v, want false", found["enabled"])
++	}
++
++	// ... while the surfaces that serve models still hide it.
++	visible := service.PortalVisibleModelIDs("", "")
++	if _, present := visible[disabledID]; present {
++		t.Fatal("disabled model is still portal-visible")
++	}
++	if _, present := visible[enabledModel]; !present {
++		t.Fatalf("enabled model %q lost its portal visibility", enabledModel)
++	}
++}
+diff --git a/internal/management/modelcatalog/portal_visibility.go b/internal/management/modelcatalog/portal_visibility.go
+index 9dbda64d..f7c52b53 100644
+--- a/internal/management/modelcatalog/portal_visibility.go
++++ b/internal/management/modelcatalog/portal_visibility.go
+@@ -15,7 +15,13 @@ const portalRootModelsPath = "/v1/models"
+ // editor can see models that are not yet on a group's allow-list — otherwise the
+ // list used to add a model is itself filtered by the setting being edited.
+ func (s *Service) PortalVisibleModelIDs(allowedChannelsRaw, allowedGroupsRaw string, opts ...AvailabilityFilterOptions) map[string]struct{} {
+-	configuredIDs := configuredAvailabilityModelIDs(s.ConfiguredAvailability(allowedChannelsRaw, allowedGroupsRaw, opts...))
++	// ConfiguredAvailability keeps disabled models so the management catalog can
++	// render their toggle; every surface that actually serves models has to take
++	// them back out.
++	configuredIDs := dropDisabledModelIDs(
++		configuredAvailabilityModelIDs(s.ConfiguredAvailability(allowedChannelsRaw, allowedGroupsRaw, opts...)),
++		s.tenantID,
++	)
+ 	rootPathIDs := rootModelsPathIDs(s.PathAvailability(opts...))
+ 	visible := make(map[string]struct{})
+ 	for id := range configuredIDs {
 diff --git a/internal/management/settings/modelconfig/disabled_models_test.go b/internal/management/settings/modelconfig/disabled_models_test.go
 new file mode 100644
 index 00000000..b6d067c3
@@ -1375,6 +1584,37 @@ index 8889234e..94a56d88 100644
  	}
  }
  
+diff --git a/internal/runtime/executor/claude_executor.go b/internal/runtime/executor/claude_executor.go
+index 14dca28c..a8ac1a38 100644
+--- a/internal/runtime/executor/claude_executor.go
++++ b/internal/runtime/executor/claude_executor.go
+@@ -155,7 +155,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
+ 	}
+ 	recorder.RecordResponseMetadata(httpResp.StatusCode, httpResp.Header.Clone())
+ 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+-		b := readUpstreamErrorBody(e.Identifier(), httpResp.Body)
++		b := readDecodedUpstreamErrorBody(e.Identifier(), httpResp.Header, httpResp.Body)
+ 		recorder.AppendResponseChunk(b)
+ 		logWithRequestID(execCtx.Context).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+ 		reporter.publishFailureWithContent(execCtx.Context, string(req.Payload), string(b))
+@@ -290,7 +290,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 	}
+ 	recorder.RecordResponseMetadata(httpResp.StatusCode, httpResp.Header.Clone())
+ 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+-		b := readUpstreamErrorBody(e.Identifier(), httpResp.Body)
++		b := readDecodedUpstreamErrorBody(e.Identifier(), httpResp.Header, httpResp.Body)
+ 		recorder.AppendResponseChunk(b)
+ 		logWithRequestID(execCtx.Context).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+ 		reporter.publishFailureWithContent(execCtx.Context, string(req.Payload), string(b))
+@@ -433,7 +433,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
+ 	}
+ 	recorder.RecordResponseMetadata(resp.StatusCode, resp.Header.Clone())
+ 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+-		b := readUpstreamErrorBody(e.Identifier(), resp.Body)
++		b := readDecodedUpstreamErrorBody(e.Identifier(), resp.Header, resp.Body)
+ 		recorder.AppendResponseChunk(b)
+ 		if errClose := resp.Body.Close(); errClose != nil {
+ 			log.Errorf("response body close error: %v", errClose)
 diff --git a/internal/runtime/executor/claude_transport.go b/internal/runtime/executor/claude_transport.go
 index 9c7b165c..8cfec76c 100644
 --- a/internal/runtime/executor/claude_transport.go
@@ -1453,6 +1693,143 @@ index 9c7b165c..8cfec76c 100644
 +		}
 +	}
 +	return 0
++}
+diff --git a/internal/runtime/executor/response_body_limits.go b/internal/runtime/executor/response_body_limits.go
+index 8470634f..0789a596 100644
+--- a/internal/runtime/executor/response_body_limits.go
++++ b/internal/runtime/executor/response_body_limits.go
+@@ -1,8 +1,10 @@
+ package executor
+ 
+ import (
++	"bytes"
+ 	"fmt"
+ 	"io"
++	"net/http"
+ 	"strings"
+ )
+ 
+@@ -51,6 +53,41 @@ func readUpstreamErrorBody(provider string, r io.Reader) []byte {
+ 	return data
+ }
+ 
++// readDecodedUpstreamErrorBody reads an upstream error body and decodes it per
++// Content-Encoding before the bytes are turned into a client-facing message, a
++// recorded response chunk, or a failure log entry.
++//
++// Anthropic compresses its error payloads (Content-Encoding: br) and the success
++// path already decodes them via decodeResponseBody; the error path used the raw
++// bytes, so a rate-limit response reached the client — and the logs — as binary
++// noise instead of the message that explains it.
++func readDecodedUpstreamErrorBody(provider string, header http.Header, r io.Reader) []byte {
++	body := readUpstreamErrorBody(provider, r)
++	if len(body) == 0 || header == nil {
++		return body
++	}
++	encoding := strings.TrimSpace(header.Get("Content-Encoding"))
++	if encoding == "" || strings.EqualFold(encoding, "identity") {
++		return body
++	}
++
++	decoded, err := decodeResponseBody(io.NopCloser(bytes.NewReader(body)), encoding)
++	if err != nil {
++		return body
++	}
++	defer func() { _ = decoded.Close() }()
++
++	limit := providerUpstreamBodyReadLimit(provider).errorBytes
++	raw, truncated, err := readBodyAtMost(decoded, limit)
++	if err != nil || len(raw) == 0 {
++		return body
++	}
++	if truncated {
++		raw = append(raw, []byte(fmt.Sprintf("\n[cliproxy: upstream error body truncated at %s]", formatByteLimit(limit)))...)
++	}
++	return raw
++}
++
+ func readBodyAtMost(r io.Reader, limit int64) ([]byte, bool, error) {
+ 	if r == nil {
+ 		return nil, false, nil
+diff --git a/internal/runtime/executor/response_body_limits_test.go b/internal/runtime/executor/response_body_limits_test.go
+new file mode 100644
+index 00000000..102d93bb
+--- /dev/null
++++ b/internal/runtime/executor/response_body_limits_test.go
+@@ -0,0 +1,74 @@
++package executor
++
++import (
++	"bytes"
++	"compress/gzip"
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/andybalholm/brotli"
++)
++
++const sampleRateLimitErrorJSON = `{"type":"error","error":{"type":"rate_limit_error","message":"7 day limit reached"}}`
++
++func decodeErrorBodyWithHeader(t *testing.T, body []byte, encoding string) string {
++	t.Helper()
++	header := http.Header{}
++	if encoding != "" {
++		header.Set("Content-Encoding", encoding)
++	}
++	return string(readDecodedUpstreamErrorBody("claude", header, bytes.NewReader(body)))
++}
++
++// Anthropic answers 429 with a brotli-compressed body. Reading it raw made the
++// client-facing error a blob of binary noise, which is exactly the case an
++// operator needs to be able to read.
++func TestReadDecodedUpstreamErrorBodyDecodesBrotli(t *testing.T) {
++	var buf bytes.Buffer
++	writer := brotli.NewWriter(&buf)
++	if _, err := writer.Write([]byte(sampleRateLimitErrorJSON)); err != nil {
++		t.Fatalf("brotli write: %v", err)
++	}
++	if err := writer.Close(); err != nil {
++		t.Fatalf("brotli close: %v", err)
++	}
++
++	got := decodeErrorBodyWithHeader(t, buf.Bytes(), "br")
++	if got != sampleRateLimitErrorJSON {
++		t.Fatalf("decoded body = %q, want %q", got, sampleRateLimitErrorJSON)
++	}
++}
++
++func TestReadDecodedUpstreamErrorBodyDecodesGzip(t *testing.T) {
++	var buf bytes.Buffer
++	writer := gzip.NewWriter(&buf)
++	if _, err := writer.Write([]byte(sampleRateLimitErrorJSON)); err != nil {
++		t.Fatalf("gzip write: %v", err)
++	}
++	if err := writer.Close(); err != nil {
++		t.Fatalf("gzip close: %v", err)
++	}
++
++	if got := decodeErrorBodyWithHeader(t, buf.Bytes(), "gzip"); got != sampleRateLimitErrorJSON {
++		t.Fatalf("decoded body = %q, want %q", got, sampleRateLimitErrorJSON)
++	}
++}
++
++func TestReadDecodedUpstreamErrorBodyPassesThroughUnencoded(t *testing.T) {
++	for _, encoding := range []string{"", "identity"} {
++		if got := decodeErrorBodyWithHeader(t, []byte(sampleRateLimitErrorJSON), encoding); got != sampleRateLimitErrorJSON {
++			t.Fatalf("Content-Encoding %q: body = %q, want the raw body", encoding, got)
++		}
++	}
++}
++
++// A body that does not actually match its declared encoding must still be
++// surfaced: the error text is the only diagnostic the caller gets.
++func TestReadDecodedUpstreamErrorBodyKeepsUndecodableBody(t *testing.T) {
++	raw := []byte("not brotli at all")
++	got := decodeErrorBodyWithHeader(t, raw, "br")
++	if !strings.Contains(got, "not brotli") {
++		t.Fatalf("body = %q, want the raw body preserved", got)
++	}
 +}
 diff --git a/internal/translator/claude/openai/responses/claude_openai-responses_response.go b/internal/translator/claude/openai/responses/claude_openai-responses_response.go
 index e77b09e1..5bfb8e78 100644

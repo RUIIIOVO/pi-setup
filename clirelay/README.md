@@ -1,7 +1,7 @@
 # CliRelay patch for the pi CLIProxyAPI provider
 
 Target deployment: `vps-us-sj:/root/CliRelay` (base commit `1effc9b`).
-Running image: `clirelay:patched-antigravity-pi-v8`.
+Running image: `clirelay:patched-catalog-v10`.
 
 The same changes are tracked as a real git branch (easier to rebase than a
 flat patch file):
@@ -20,7 +20,9 @@ Deploy history (`.env` pins `CLI_PROXY_IMAGE`, `CLI_PROXY_PULL_POLICY=never`):
 |---|---|
 | `clirelay:patched-1effc9b-fable51-v3` | items 1-5 |
 | `clirelay:patched-disabled-models-v6` | item 6 |
-| `clirelay:patched-antigravity-pi-v8` | items 7-8 |
+| `clirelay:patched-antigravity-pi-v8` | items 7-9 |
+| `clirelay:patched-antigravity-pi-v9` | item 10 |
+| `clirelay:patched-catalog-v10` | item 11 |
 
 ## What the patch changes
 
@@ -151,6 +153,31 @@ Deploy history (`.env` pins `CLI_PROXY_IMAGE`, `CLI_PROXY_PULL_POLICY=never`):
    (deleted; see `../README.md`), which hardcoded four Claude ids into the
    plugin and hid every Gemini model.
 
+10. `internal/runtime/executor/response_body_limits.go` + `claude_executor.go`
+    Anthropic answers 429 with a brotli-compressed body (`Content-Encoding: br`).
+    The success path already decoded that; the three error paths used the raw
+    bytes as the `statusErr` message, the recorded response chunk and the failure
+    log, so a rate-limit response reached the client — and the logs — as binary
+    noise. `readDecodedUpstreamErrorBody` decodes per Content-Encoding first,
+    re-applies the per-provider size limit, and falls back to the raw body when it
+    cannot be decoded.
+
+11. `internal/management/modelcatalog/{availability,portal_visibility,availability_model_enablement}.go`
+    Item 6 made the disable toggle subtractive, but it also applied the
+    subtraction to `ConfiguredAvailability` — the operator's own view. The
+    management catalog page intersects the `model_configs` rows with it, so
+    disabling a model removed the row that carries its toggle: the model vanished
+    from the page and could never be switched back on. Observed live: the page
+    listed 14 models, all enabled, with 23 disabled rows invisible.
+
+    The two management endpoints are not interchangeable, and the panel bundle
+    proves it: `/models/configured-availability` backs the catalog page (must list
+    disabled models), `/models` backs the model plaza and the channel-group editor
+    (must not). So `ConfiguredAvailability` keeps disabled models and publishes
+    `enabled` per entry, `Models()` keeps dropping them, and
+    `PortalVisibleModelIDs` — derived from `ConfiguredAvailability`, and what pi
+    and the public catalog read — takes over the subtraction.
+
 ## Model catalog
 
 The Claude OAuth channel merges the static definitions above with the tenant
@@ -200,7 +227,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" \
 
 scp CLIProxyAPI vps-us-sj:/tmp/ccbuild/CLIProxyAPI
 ssh vps-us-sj 'cd /tmp/ccbuild \
-  && printf "FROM clirelay:patched-antigravity-pi-v8\nCOPY --chown=clirelay:clirelay CLIProxyAPI /CLIProxyAPI/CLIProxyAPI\n" > Dockerfile \
+  && printf "FROM clirelay:patched-catalog-v10\nCOPY --chown=clirelay:clirelay CLIProxyAPI /CLIProxyAPI/CLIProxyAPI\n" > Dockerfile \
   && docker build -t clirelay:patched-<tag> . \
   && cd /root/CliRelay \
   && sed -i "s|^CLI_PROXY_IMAGE=.*|CLI_PROXY_IMAGE=clirelay:patched-<tag>|" .env \
